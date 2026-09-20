@@ -78,6 +78,9 @@ COOKIE_REFRESH = "yiz_refresh"
 CROSS_ORIGIN = os.getenv("CROSS_ORIGIN", "false").lower() in ("1", "true", "yes")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
+# Public origin of this service (Render sets RENDER_EXTERNAL_URL automatically).
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL")
+                   or os.getenv("RENDER_EXTERNAL_URL", "")).strip().rstrip("/")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -1145,6 +1148,30 @@ def _validate_mcp_url(name: str, raw: str) -> Optional[str]:
     return url
 
 
+def _normalise_mcp_tool(t: dict) -> dict:
+    """Coerce one advertised MCP tool into a schema a provider will accept."""
+    schema = t.get("inputSchema")
+    if not isinstance(schema, dict) or schema.get("type") not in (None, "object"):
+        schema = {"type": "object", "properties": {}}
+    else:
+        schema = dict(schema)
+        schema["type"] = "object"
+        props = schema.get("properties")
+        if not isinstance(props, dict):
+            props = {}
+        schema["properties"] = {k: v for k, v in props.items() if isinstance(v, dict)}
+        required = schema.get("required")
+        if isinstance(required, list):
+            schema["required"] = [r for r in required
+                                  if isinstance(r, str) and r in schema["properties"]]
+        else:
+            schema.pop("required", None)
+    description = t.get("description")
+    return {"name": t["name"],
+            "description": description if isinstance(description, str) else "",
+            "inputSchema": schema}
+
+
 class MCPClient:
     """Minimal JSON-RPC client for configured MCP servers."""
     def __init__(self) -> None:
@@ -1219,7 +1246,8 @@ class MCPClient:
             log.warning("MCP tools/list failed for %s: %s", server, resp["error"])
             return []
         tools = (resp.get("result") or {}).get("tools", []) or []
-        tools = [t for t in tools if isinstance(t, dict) and t.get("name")]
+        tools = [_normalise_mcp_tool(t) for t in tools
+                 if isinstance(t, dict) and isinstance(t.get("name"), str) and t["name"]]
         self._cache[server] = tools
         return tools
 
@@ -1236,10 +1264,11 @@ class MCPClient:
         out = []
         for server in self.servers:
             for t in await self.list_tools(server):
+                t = _normalise_mcp_tool(t)
                 out.append({"server": server,
                             "name": f"mcp__{server}__{t['name']}",
-                            "description": t.get("description", ""),
-                            "input_schema": t.get("inputSchema", {"type": "object"})})
+                            "description": t["description"],
+                            "input_schema": t["inputSchema"]})
         return out
 
 
@@ -2786,9 +2815,13 @@ async function send(){if(streaming)return;const ip=$('#ip');const p=ip.value.tri
 const w=document.querySelector('.wel');if(w)w.remove();
 addMsg('user',p);ip.value='';grow();dwn();
 streaming=true;$('#send').disabled=true;
-const{bd:b}=addMsg('assistant','');b.innerHTML='<span class="cur"></span>';
-let txt='';let streamError=false;const tbs=new Map();const mediaPls=[];
-const render=cur=>{b.innerHTML=rmd(txt)+(cur?'<span class="cur"></span>':'');mediaPls.forEach(m=>appendMedia(b,m))};
+const{bd:b}=addMsg('assistant','');b.innerHTML='';
+const txtEl=mk('div');const medEl=mk('div');b.appendChild(txtEl);b.appendChild(medEl);
+txtEl.innerHTML='<span class="cur"></span>';
+let txt='';let streamError=false;let mediaCount=0;const tbs=new Map();
+// Text is re-rendered on every token; media nodes live in their own container so
+// each element is created exactly once and never duplicated or reloaded.
+const render=cur=>{txtEl.innerHTML=rmd(txt)+(cur?'<span class="cur"></span>':'')};
 try{
 const endpoint=uploadedFiles.length?'/api/chat-with-files':'/api/chat';
 const payload={prompt:p,conversation_id:cid};
@@ -2806,11 +2839,11 @@ if(!d)continue;let pl;try{pl=JSON.parse(d)}catch{continue}
 if(ev==='token'){txt+=pl.delta;render(true);dwn()}
 else if(ev==='tool_start'){const x=addTool(pl.name,pl.args);x._args=pl.args;tbs.set(pl.id,x);dwn()}
 else if(ev==='tool_end'){const x=tbs.get(pl.id);if(x)finishTool(x,pl.result);dwn()}
-else if(ev==='media'){mediaPls.push(pl);render(true);dwn()}
+else if(ev==='media'){mediaCount++;appendMedia(medEl,pl);dwn()}
 else if(ev==='error'){streamError=true;b.innerHTML='<span style="color:#ffb3bd">⚠️ '+esc(pl.message)+'</span>';dwn()}
 else if(ev==='done'){if(pl.conversation_id&&pl.conversation_id!==cid){cid=pl.conversation_id;markA();loadConvs()}
 $('#ct').textContent=p.slice(0,60)}}}
-if(!streamError){if(txt.trim()||mediaPls.length)render(false);else b.innerHTML=rmd('*(no response)*')}
+if(!streamError){if(txt.trim()||mediaCount)render(false);else txtEl.innerHTML=rmd('*(no response)*')}
 hl(b);dwn();loadConvs();markA();
 }catch(e){b.innerHTML='<span style="color:#ffb3bd">⚠️ '+esc(e.message)+'</span>';toast(e.message,1)}
 finally{streaming=false;$('#send').disabled=false;$('#ip').focus()}}
@@ -2912,12 +2945,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Yiz AI", version="5.0.0", lifespan=lifespan)
 
-if ALLOWED_ORIGINS in ([], ["*"]):
+def _cors_origins() -> list[str]:
+    """Explicit origin allow-list, derived from config when not set directly."""
+    if ALLOWED_ORIGINS and ALLOWED_ORIGINS != ["*"]:
+        return ALLOWED_ORIGINS
+    derived = [u for u in (FRONTEND_URL, PUBLIC_BASE_URL) if u]
+    return list(dict.fromkeys(derived))
+
+
+if not IS_PROD and ALLOWED_ORIGINS in ([], ["*"]):
+    # Development only: any origin, so a local frontend can talk to the API.
     app.add_middleware(CORSMiddleware, allow_origin_regex=".*",
                        allow_credentials=True, allow_methods=["*"],
                        allow_headers=["*"])
+elif ALLOWED_ORIGINS == ["*"] and IS_PROD:
+    # Wildcard plus cookies is unsafe; serve the allow-list instead and warn.
+    log.warning('ALLOWED_ORIGINS="*" is ignored in production; set real origins.')
+    app.add_middleware(CORSMiddleware, allow_origins=_cors_origins(),
+                       allow_credentials=True, allow_methods=["*"],
+                       allow_headers=["*"])
 else:
-    app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
+    origins = _cors_origins()
+    if not origins:
+        log.warning("ALLOWED_ORIGINS not set: cross-origin requests are blocked "
+                    "(same-origin UI still works).")
+    app.add_middleware(CORSMiddleware, allow_origins=origins,
                        allow_credentials=True, allow_methods=["*"],
                        allow_headers=["*"])
 
