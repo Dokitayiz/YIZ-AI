@@ -1,0 +1,11 @@
+#!/usr/bin/env pwsh
+$ErrorActionPreference = "Stop"
+Write-Host "1. Ensure Floot CLI is installed and authenticated."
+Write-Host "2. Set the environment variables from .env.example in Floot's dashboard."
+Write-Host "3. Attach a Postgres instance and set DATABASE_URL."
+Write-Host "4. Attach a persistent volume mounted at /app/media."
+Write-Host "5. Run the deploy command from Floot's docs, e.g.:"
+Write-Host "     floot deploy"
+Write-Host ""
+Write-Host "If Floot reads a Dockerfile, this folder is ready as-is."
+Write-Host "If Floot reads a Procfile, the Procfile is here too."
