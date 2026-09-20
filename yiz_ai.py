@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Optional
 from urllib.parse import quote, urlencode, urlparse
+from xml.sax.saxutils import escape as _xml_escape
 
 import asyncpg
 import httpx
@@ -95,7 +96,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 # anthropic | openai | ollama | "" (auto: anthropic, then openai, then ollama)
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()
 # Allow callers to pick any model the configured providers expose.
-ALLOW_MODEL_OVERRIDE = os.getenv("ALLOW_MODEL_OVERRIDE", "true").lower() in ("1", "true", "yes")
+ALLOW_MODEL_OVERRIDE = os.getenv("ALLOW_MODEL_OVERRIDE", "false").lower() in ("1", "true", "yes")
 # When an override is used, require the model to appear in that provider's live
 # /api/models listing. Fails open (allows the request) if the listing call itself
 # fails, so a flaky provider API can't block chat entirely.
@@ -1287,8 +1288,12 @@ class PluginLoader:
         self.directory = directory
         self.loaded = []
 
-    def load_all(self) -> list[dict]:
-        """Import every well-formed plugin module in the directory."""
+    def load_all(self, reserved_names: frozenset[str] = frozenset()) -> list[dict]:
+        """Import every well-formed plugin module in the directory.
+
+        reserved_names is normally the set of already-registered built-in
+        tool names, so a plugin cannot silently shadow one of them.
+        """
         self.loaded = []
         if not self.directory.exists():
             return self.loaded
@@ -1302,6 +1307,19 @@ class PluginLoader:
                 if not all(hasattr(mod, a) for a in
                            ("NAME", "DESCRIPTION", "PARAMETERS", "run")):
                     log.warning("plugin %s: missing required attrs", path.name)
+                    continue
+                if (not isinstance(mod.NAME, str)
+                        or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", mod.NAME)
+                        or not isinstance(mod.DESCRIPTION, str)
+                        or not isinstance(mod.PARAMETERS, dict)
+                        or not callable(mod.run)):
+                    log.warning("plugin %s: invalid metadata (name/description/"
+                               "parameters/run)", path.name)
+                    continue
+                if mod.NAME in reserved_names or any(mod.NAME == p["name"]
+                                                      for p in self.loaded):
+                    log.warning("plugin %s: name %r collides with a built-in "
+                               "tool or another plugin, skipping", path.name, mod.NAME)
                     continue
                 self.loaded.append({"name": mod.NAME, "description": mod.DESCRIPTION,
                                     "parameters": mod.PARAMETERS, "run": mod.run,
@@ -2143,11 +2161,12 @@ async def _generate_pdf(filename: Optional[str], title: str, sections: Optional[
         h = sec.get("heading")
         b = sec.get("body", "")
         if h:
-            flow.append(Paragraph(h, styles["Heading2"]))
+            flow.append(Paragraph(_xml_escape(str(h)), styles["Heading2"]))
             flow.append(Spacer(1, 6))
         for para in str(b).split("\n\n"):
             if para.strip():
-                flow.append(Paragraph(para.strip().replace("\n", "<br/>"), body_style))
+                safe_para = _xml_escape(para.strip()).replace("\n", "<br/>")
+                flow.append(Paragraph(safe_para, body_style))
                 flow.append(Spacer(1, 8))
         flow.append(Spacer(1, 12))
     doc.build(flow)
@@ -2185,6 +2204,8 @@ async def _generate_xlsx(filename: Optional[str], sheets: Optional[list],
         for col in ws.columns:
             width = max((len(str(c.value or "")) for c in col), default=8)
             ws.column_dimensions[col[0].column_letter].width = min(width + 2, 40)
+    if not wb.worksheets:
+        wb.create_sheet(title="Sheet1")
     buf = io.BytesIO()
     wb.save(buf)
     data = buf.getvalue()
@@ -2276,11 +2297,22 @@ _DUCK_READERS = {"csv": "read_csv_auto", "parquet": "read_parquet",
                  "pq": "read_parquet", "json": "read_json_auto"}
 
 
-def _resolve_source(source: str) -> Optional[Path]:
-    """Materialize a caller-supplied object through the media abstraction."""
+async def _resolve_source(source: str, user_id: str) -> Optional[Path]:
+    """Resolve a caller-supplied stored filename, scoped to its owner.
+
+    Looks the key up in the database first so one user cannot read another
+    user's stored file by guessing or copying its stored name.
+    """
     if not source or len(source) > 260:
         return None
-    return media_store.path(source)
+    try:
+        key = media_store._safe_key(source)
+    except ValueError:
+        return None
+    meta = await db.get_media(key, user_id)
+    if not meta:
+        return None
+    return media_store.path(key)
 
 
 def _duck_load(con: Any, path: Path) -> None:
@@ -2304,14 +2336,14 @@ def _duck_lockdown(con: Any) -> None:
             log.warning("duckdb lockdown statement rejected: %s", stmt)
 
 
-async def _analyze_data(source: str, **_: Any) -> dict[str, Any]:
+async def _analyze_data(source: str, user_id: str, **_: Any) -> dict[str, Any]:
     """Profile a stored CSV/Parquet/JSON file, or raw CSV text."""
     try:
         import duckdb
         import pandas as pd  # noqa: F401
     except ImportError:
         return {"error": "duckdb or pandas not installed"}
-    path = _resolve_source(source) if "." in (source or "") else None
+    path = await _resolve_source(source, user_id) if "." in (source or "") else None
     tmp_dir = None
     try:
         con = duckdb.connect()
@@ -2341,13 +2373,14 @@ async def _analyze_data(source: str, **_: Any) -> dict[str, Any]:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-async def _query_data(source: str, sql: str, **_: Any) -> dict[str, Any]:
+async def _query_data(source: str, sql: str, user_id: str,
+                      **_: Any) -> dict[str, Any]:
     """Run caller SQL over a stored file with DuckDB, filesystem access off."""
     try:
         import duckdb
     except ImportError:
         return {"error": "duckdb not installed"}
-    path = _resolve_source(source)
+    path = await _resolve_source(source, user_id)
     if not path:
         return {"error": "no data source provided"}
     try:
@@ -2532,14 +2565,14 @@ class ToolRegistry:
           {"type": "object",
            "properties": {"source": {"type": "string"}},
            "required": ["source"]},
-          _analyze_data, is_async=True)
+          _analyze_data, is_async=True, needs_user=True)
         R("query_data",
           "Run SQL over an uploaded CSV/Parquet/JSON file using DuckDB.",
           {"type": "object",
            "properties": {"source": {"type": "string"},
                           "sql": {"type": "string"}},
            "required": ["source", "sql"]},
-          _query_data, is_async=True)
+          _query_data, is_async=True, needs_user=True)
 
     async def _run_code(self, user_id: str, language: str, code: str,
                         stdin: Optional[str] = "") -> dict[str, Any]:
@@ -2587,6 +2620,10 @@ class ToolRegistry:
     def schemas(self) -> list[dict]:
         """Every registered tool schema."""
         return [t["schema"] for t in self._tools.values()]
+
+    def schema_names(self) -> list[str]:
+        """Names of every registered tool, for plugin name-collision checks."""
+        return list(self._tools.keys())
 
     @staticmethod
     def _clean_args(schema: dict, args: Any) -> dict:
@@ -2956,7 +2993,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise RuntimeError("DATABASE_URL not set")
     await db.connect()
     await rate_limiter.init()
-    plugin_loader.load_all()
+    plugin_loader.load_all(reserved_names=frozenset(tools.schema_names()))
     for p in plugin_loader.loaded:
         tools.register(p["name"], p["description"], p["parameters"],
                        p["run"],
