@@ -1107,7 +1107,7 @@ class MCPClient:
         return list(self.servers.keys())
 
     async def _rpc(self, server: str, method: str, params: dict) -> dict[str, Any]:
-        """Send one JSON-RPC call to a configured server."""
+        """Send one JSON-RPC call to a configured server; never raises."""
         if server not in self.servers:
             return {"error": f"unknown MCP server: {server}"}
         url = f"{self.servers[server]}/mcp"
@@ -1117,16 +1117,27 @@ class MCPClient:
                 r = await c.post(url, json=payload,
                                  headers={"Content-Type": "application/json",
                                           "Accept": "application/json"})
-            return r.json()
+            data = r.json()
         except httpx.HTTPError as e:
+            log.warning("MCP %s %s failed: %s", server, method, e)
             return {"error": f"MCP call failed: {e}"}
+        except (json.JSONDecodeError, ValueError) as e:
+            log.warning("MCP %s %s returned invalid JSON: %s", server, method, e)
+            return {"error": "MCP server returned an invalid response"}
+        if not isinstance(data, dict):
+            log.warning("MCP %s %s returned a non-object response", server, method)
+            return {"error": "MCP server returned an invalid response"}
+        return data
 
     async def list_tools(self, server: str) -> list[dict]:
-        """List a server's tools, cached per process."""
+        """List a server's tools, cached per process; malformed schemas are dropped."""
         if server in self._cache:
             return self._cache[server]
         resp = await self._rpc(server, "tools/list", {})
-        tools = (resp.get("result") or {}).get("tools", [])
+        raw = (resp.get("result") or {}).get("tools", [])
+        if not isinstance(raw, list):
+            raw = []
+        tools = [t for t in raw if isinstance(t, dict) and isinstance(t.get("name"), str)]
         self._cache[server] = tools
         return tools
 
@@ -1139,14 +1150,21 @@ class MCPClient:
         return resp.get("result", {})
 
     async def all_tools(self) -> list[dict]:
-        """Every MCP tool across servers, namespaced for the model."""
+        """Every MCP tool across servers, namespaced for the model.
+
+        One server's failure never blocks the others or the caller."""
         out = []
         for server in self.servers:
-            for t in await self.list_tools(server):
+            try:
+                server_tools = await self.list_tools(server)
+            except Exception as e:
+                log.warning("MCP %s discovery failed: %s", server, e)
+                continue
+            for t in server_tools:
                 out.append({"server": server,
                             "name": f"mcp__{server}__{t['name']}",
                             "description": t.get("description", ""),
-                            "input_schema": t.get("inputSchema", {"type": "object"})})
+                            "input_schema": t.get("inputSchema") or {"type": "object"}})
         return out
 
 
@@ -1885,8 +1903,8 @@ async def _generate_pdf(filename: Optional[str], title: str, sections: Optional[
         flow.append(Spacer(1, 12))
     doc.build(flow)
     data = buf.getvalue()
-    stored = await store_media(data, "pdf", "application/pdf", fname)
     fname = _safe_name(filename or "document.pdf", "pdf")
+    stored = await store_media(data, "pdf", "application/pdf", fname)
     return {"filename": fname, "size": len(data),
             "download_url": f"/api/media/{stored}?name={quote(fname)}"}
 
@@ -1919,8 +1937,8 @@ async def _generate_xlsx(filename: Optional[str], sheets: Optional[list],
     buf = io.BytesIO()
     wb.save(buf)
     data = buf.getvalue()
-    stored = await store_media(data, "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", fname)
     fname = _safe_name(filename or "workbook.xlsx", "xlsx")
+    stored = await store_media(data, "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", fname)
     return {"filename": fname, "size": len(data),
             "download_url": f"/api/media/{stored}?name={quote(fname)}"}
 
@@ -1946,8 +1964,8 @@ async def _generate_docx(filename: Optional[str], title: str,
     buf = io.BytesIO()
     doc.save(buf)
     data = buf.getvalue()
-    stored = await store_media(data, "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", fname)
     fname = _safe_name(filename or "document.docx", "docx")
+    stored = await store_media(data, "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", fname)
     return {"filename": fname, "size": len(data),
             "download_url": f"/api/media/{stored}?name={quote(fname)}"}
 
@@ -2001,11 +2019,18 @@ _DUCK_READERS = {"csv": "read_csv_auto", "parquet": "read_parquet",
                  "pq": "read_parquet", "json": "read_json_auto"}
 
 
-def _resolve_source(source: str) -> Optional[Path]:
-    """Materialize a caller-supplied object through the media abstraction."""
+async def _resolve_source(source: str, user_id: str) -> Optional[Path]:
+    """Resolve a caller-supplied object, scoped to files the caller owns."""
     if not source or len(source) > 260:
         return None
-    return media_store.path(source)
+    try:
+        key = media_store._safe_key(source)
+    except ValueError:
+        return None
+    meta = await db.get_media(key, user_id)
+    if not meta:
+        return None
+    return media_store.path(key)
 
 
 def _duck_load(con: Any, path: Path) -> None:
@@ -2029,14 +2054,14 @@ def _duck_lockdown(con: Any) -> None:
             log.warning("duckdb lockdown statement rejected: %s", stmt)
 
 
-async def _analyze_data(source: str, **_: Any) -> dict[str, Any]:
-    """Profile a stored CSV/Parquet/JSON file, or raw CSV text."""
+async def _analyze_data(source: str, user_id: str, **_: Any) -> dict[str, Any]:
+    """Profile a caller-owned CSV/Parquet/JSON file, or raw CSV text."""
     try:
         import duckdb
         import pandas as pd  # noqa: F401
     except ImportError:
         return {"error": "duckdb or pandas not installed"}
-    path = _resolve_source(source) if "." in (source or "") else None
+    path = await _resolve_source(source, user_id) if "." in (source or "") else None
     tmp_dir = None
     try:
         con = duckdb.connect()
@@ -2066,15 +2091,15 @@ async def _analyze_data(source: str, **_: Any) -> dict[str, Any]:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-async def _query_data(source: str, sql: str, **_: Any) -> dict[str, Any]:
-    """Run caller SQL over a stored file with DuckDB, filesystem access off."""
+async def _query_data(source: str, sql: str, user_id: str, **_: Any) -> dict[str, Any]:
+    """Run caller SQL over a caller-owned stored file with DuckDB, filesystem access off."""
     try:
         import duckdb
     except ImportError:
         return {"error": "duckdb not installed"}
-    path = _resolve_source(source)
+    path = await _resolve_source(source, user_id)
     if not path:
-        return {"error": "no data source provided"}
+        return {"error": "no data source provided, or it does not belong to you"}
     try:
         con = duckdb.connect()
         _duck_load(con, path)
@@ -2257,14 +2282,14 @@ class ToolRegistry:
           {"type": "object",
            "properties": {"source": {"type": "string"}},
            "required": ["source"]},
-          _analyze_data, is_async=True)
+          _analyze_data, is_async=True, needs_user=True)
         R("query_data",
           "Run SQL over an uploaded CSV/Parquet/JSON file using DuckDB.",
           {"type": "object",
            "properties": {"source": {"type": "string"},
                           "sql": {"type": "string"}},
            "required": ["source", "sql"]},
-          _query_data, is_async=True)
+          _query_data, is_async=True, needs_user=True)
 
     async def _run_code(self, user_id: str, language: str, code: str,
                         stdin: Optional[str] = "") -> dict[str, Any]:
@@ -2483,7 +2508,7 @@ const esc=s=>String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'
 function toast(m,e){const t=$('#tst');t.textContent=m;t.className='toast show'+(e?' err':'');clearTimeout(toast._);toast._=setTimeout(()=>t.className='toast',3400)}
 async function jf(path,opts){const r=await fetch(API+path,{credentials:'include',headers:H,...opts});if(r.status===401){authShow();throw new Error('sign in required')}return r}
 async function health(){try{const d=await(await fetch(API+'/api/health',{credentials:'include'})).json();
-if(d.ok){$('#sd').style.background='var(--acc2)';$('#st').textContent='online';$('#mp').textContent=d.provider+' · '+d.model;$('#ht').textContent=(d.tools?d.tools.length+' tools · ':'')+(d.sandbox||'')}
+if(d.ok){$('#sd').style.background='var(--acc2)';$('#st').textContent='online';$('#mp').textContent=(d.provider||'unknown')+' · '+(d.model||'unknown');$('#ht').textContent=(d.tools?d.tools.length+' tools · ':'')+(d.sandbox||'')}
 else{$('#sd').style.background='#ffb020';$('#st').textContent='no model';$('#mp').textContent='—';$('#ht').textContent=d.error||''}}
 catch{$('#sd').style.background='#ff6b81';$('#st').textContent='offline'}}
 const mk=(t,c,h)=>{const n=document.createElement(t);if(c)n.className=c;if(h!=null)n.innerHTML=h;return n};
@@ -2554,7 +2579,7 @@ const w=document.querySelector('.wel');if(w)w.remove();
 addMsg('user',p);ip.value='';grow();dwn();
 streaming=true;$('#send').disabled=true;
 const{bd:b}=addMsg('assistant','');b.innerHTML='<span class="cur"></span>';
-let txt='';const tbs=new Map();
+let txt='';const tbs=new Map();let streamError=false;
 try{
 const endpoint=uploadedFiles.length?'/api/chat-with-files':'/api/chat';
 const payload={prompt:p,conversation_id:cid};
@@ -2572,11 +2597,12 @@ if(ev==='token'){txt+=pl.delta;b.innerHTML=rmd(txt)+'<span class="cur"></span>';
 else if(ev==='tool_start'){const x=addTool(pl.name,pl.args);x._args=pl.args;tbs.set(pl.id,x);dwn()}
 else if(ev==='tool_end'){const x=tbs.get(pl.id);if(x)finishTool(x,pl.result);dwn()}
 else if(ev==='media'){appendMedia(b,pl)}
-else if(ev==='error'){b.innerHTML='<span style="color:#ffb3bd">⚠️ '+esc(pl.message)+'</span>'}
+else if(ev==='error'){streamError=true;b.innerHTML='<span style="color:#ffb3bd">⚠️ '+esc(pl.message)+'</span>'}
 else if(ev==='done'){if(pl.conversation_id&&pl.conversation_id!==cid){cid=pl.conversation_id;markA();loadConvs()}
 $('#ct').textContent=p.slice(0,60)}}}
-b.innerHTML=rmd(txt||'*(no response)*');hl(b);dwn();loadConvs();markA();
-}catch(e){b.innerHTML='<span style="color:#ffb3bd">⚠️ '+esc(e.message)+'</span>';toast(e.message,1)}
+if(!streamError){b.innerHTML=rmd(txt||'*(no response)*');hl(b)}
+dwn();loadConvs();markA();
+}catch(e){streamError=true;b.innerHTML='<span style="color:#ffb3bd">⚠️ '+esc(e.message||'Network error — check your connection.')+'</span>';toast(e.message||'Network error',1)}
 finally{streaming=false;$('#send').disabled=false;$('#ip').focus()}}
 async function openConv(id,title){cid=id;$('#ct').textContent=title||'Chat';markA();clearTh();
 try{const d=await(await jf('/api/conversations/'+id)).json();
@@ -2740,8 +2766,13 @@ async def _optional_user(request: Request) -> Optional[dict]:
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    """Lightweight liveness endpoint for platform health checks."""
-    return {"ok": True, "service": "yiz-ai", "version": "5.0.0"}
+    """Fast liveness endpoint; reports the active LLM provider when one is configured."""
+    try:
+        provider, model = pick_provider()
+    except LLMError as e:
+        return {"ok": False, "service": "yiz-ai", "version": "5.0.0", "error": str(e)}
+    return {"ok": True, "service": "yiz-ai", "version": "5.0.0",
+            "provider": provider, "model": model, "sandbox": SANDBOX_PROVIDER}
 
 @app.get("/api/ready")
 async def ready() -> Response:
@@ -3024,21 +3055,9 @@ def _trim_history(history: list[dict]) -> list[dict]:
     return window
 
 
-HEAVY_WORKER_TOOLS = {
-    "generate_image", "generate_video", "text_to_speech",
-    "generate_text_file", "generate_csv", "generate_json_file", "generate_markdown_file",
-    "generate_pdf", "generate_xlsx", "generate_docx", "make_chart", "generate_qr",
-}
-
-
 async def dispatch_tool(name: str, args: dict[str, Any], user_id: str) -> str:
-    """Run heavy media work in Redis worker when available, otherwise locally."""
-    if name in HEAVY_WORKER_TOOLS and REDIS_URL:
-        from job_queue import enqueue_and_wait, worker_available
-        if await worker_available():
-            result = await enqueue_and_wait(name, args, user_id=user_id)
-            return json.dumps(result, default=str)
-        log.warning("no fresh worker heartbeat; executing %s locally", name)
+    """Run a tool call locally. (A Redis-backed worker queue for heavy media
+    tools can be added later; there is no job_queue module in this deployment.)"""
     return await tools.call(name, args, user_id=user_id)
 
 
@@ -3050,10 +3069,13 @@ async def agent_stream(prompt: str, cid: str,
     msgs += _trim_history(await db.get_messages(cid))
 
     schemas = tools.schemas()
-    for m in await mcp_client.all_tools():
-        schemas.append({"name": m["name"],
-                        "description": f"[MCP:{m['server']}] {m['description']}",
-                        "parameters": m["input_schema"]})
+    try:
+        for m in await mcp_client.all_tools():
+            schemas.append({"name": m["name"],
+                            "description": f"[MCP:{m['server']}] {m['description']}",
+                            "parameters": m["input_schema"]})
+    except Exception as e:
+        log.warning("MCP tool discovery failed; continuing without MCP tools: %s", e)
 
     final_text = ""
     for _ in range(MAX_STEPS):
@@ -3069,7 +3091,9 @@ async def agent_stream(prompt: str, cid: str,
             yield sse("error", {"message": str(e)})
             return
         except Exception as e:
-            yield sse("error", {"message": f"{type(e).__name__}: {e}"})
+            rid = uuid.uuid4().hex[:8]
+            log.exception("agent_stream:%s unhandled error", rid)
+            yield sse("error", {"message": f"Something went wrong (ref {rid})."})
             return
 
         text = "".join(parts)
