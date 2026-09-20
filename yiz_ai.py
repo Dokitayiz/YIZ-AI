@@ -1477,8 +1477,14 @@ def resolve_model(requested: Optional[str]) -> tuple[str, str]:
     if provider is None:
         provider = _provider_for_model(model)
     if provider is None:
-        # Unknown prefix: assume a self-hosted / Ollama model when that is set up.
-        provider = "ollama" if _PROVIDERS["ollama"][0] else pick_provider()[0]
+        # Bare, unrecognised model id. Only route it to Ollama when Ollama is
+        # the explicitly chosen provider, since Ollama model names are arbitrary.
+        if LLM_PROVIDER == "ollama" and _PROVIDERS["ollama"][0]:
+            provider = "ollama"
+        else:
+            raise LLMError(
+                f"Unknown model {model!r}. Use 'provider:model' (e.g. "
+                "'ollama:llama3.1') or pick one from /api/models.")
 
     configured, default_model = _PROVIDERS[provider]
     if not configured:
@@ -1723,7 +1729,7 @@ async def _stream_anthropic(msgs: list[dict], tools_list: list[dict],
                "Content-Type": "application/json"}
     blocks = {}
     async with httpx.AsyncClient(timeout=120) as c:
-        async with c.stream("POST", "https://api.anthropic.com/v1/messages",
+        async with c.stream("POST", f"{ANTHROPIC_BASE_URL}/messages",
                             headers=headers, json=payload) as r:
             if r.status_code >= 400:
                 body = (await r.aread()).decode(errors="replace")
@@ -2094,8 +2100,8 @@ async def _generate_pdf(filename: Optional[str], title: str, sections: Optional[
         flow.append(Spacer(1, 12))
     doc.build(flow)
     data = buf.getvalue()
-    stored = await store_media(data, "pdf", "application/pdf", fname)
     fname = _safe_name(filename or "document.pdf", "pdf")
+    stored = await store_media(data, "pdf", "application/pdf", fname)
     return {"filename": fname, "size": len(data),
             "download_url": f"/api/media/{stored}?name={quote(fname)}"}
 
@@ -2128,8 +2134,11 @@ async def _generate_xlsx(filename: Optional[str], sheets: Optional[list],
     buf = io.BytesIO()
     wb.save(buf)
     data = buf.getvalue()
-    stored = await store_media(data, "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", fname)
     fname = _safe_name(filename or "workbook.xlsx", "xlsx")
+    stored = await store_media(
+        data, "xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        fname)
     return {"filename": fname, "size": len(data),
             "download_url": f"/api/media/{stored}?name={quote(fname)}"}
 
@@ -2155,8 +2164,11 @@ async def _generate_docx(filename: Optional[str], title: str,
     buf = io.BytesIO()
     doc.save(buf)
     data = buf.getvalue()
-    stored = await store_media(data, "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", fname)
     fname = _safe_name(filename or "document.docx", "docx")
+    stored = await store_media(
+        data, "docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        fname)
     return {"filename": fname, "size": len(data),
             "download_url": f"/api/media/{stored}?name={quote(fname)}"}
 
@@ -2692,7 +2704,9 @@ const esc=s=>String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'
 function toast(m,e){const t=$('#tst');t.textContent=m;t.className='toast show'+(e?' err':'');clearTimeout(toast._);toast._=setTimeout(()=>t.className='toast',3400)}
 async function jf(path,opts){const r=await fetch(API+path,{credentials:'include',headers:H,...opts});if(r.status===401){authShow();throw new Error('sign in required')}return r}
 async function health(){try{const d=await(await fetch(API+'/api/health',{credentials:'include'})).json();
-if(d.ok&&d.provider){$('#sd').style.background='var(--acc2)';$('#st').textContent='online';$('#ht').textContent=(d.providers||[]).join(' · ')+(d.sandbox?' · '+d.sandbox:'')}
+if(d.ok&&d.provider){$('#sd').style.background='var(--acc2)';$('#st').textContent='online';
+$('#ht').textContent=d.provider+' · '+(d.model||'unknown')+(d.sandbox?' · '+d.sandbox:'')+((d.providers||[]).length>1?' · '+d.providers.length+' providers':'');
+const s=$('#ms');if(s&&s.options.length)s.options[0].textContent='auto ('+d.provider+':'+(d.model||'?')+')'}
 else{$('#sd').style.background='#ffb020';$('#st').textContent='no model';$('#ht').textContent=d.warning||d.error||''}}
 catch{$('#sd').style.background='#ff6b81';$('#st').textContent='offline'}}
 async function loadModels(){const s=$('#ms');if(!s)return;
@@ -2773,7 +2787,8 @@ const w=document.querySelector('.wel');if(w)w.remove();
 addMsg('user',p);ip.value='';grow();dwn();
 streaming=true;$('#send').disabled=true;
 const{bd:b}=addMsg('assistant','');b.innerHTML='<span class="cur"></span>';
-let txt='';const tbs=new Map();
+let txt='';let streamError=false;const tbs=new Map();const mediaPls=[];
+const render=cur=>{b.innerHTML=rmd(txt)+(cur?'<span class="cur"></span>':'');mediaPls.forEach(m=>appendMedia(b,m))};
 try{
 const endpoint=uploadedFiles.length?'/api/chat-with-files':'/api/chat';
 const payload={prompt:p,conversation_id:cid};
@@ -2788,14 +2803,15 @@ while(true){const{value,done}=await rd.read();if(done)break;buf+=dc.decode(value
 let i;while((i=buf.indexOf('\n\n'))!==-1){const blk=buf.slice(0,i);buf=buf.slice(i+2);
 let ev='message',d='';for(const ln of blk.split('\n')){if(ln.startsWith('event:'))ev=ln.slice(6).trim();else if(ln.startsWith('data:'))d+=ln.slice(5).trim()}
 if(!d)continue;let pl;try{pl=JSON.parse(d)}catch{continue}
-if(ev==='token'){txt+=pl.delta;b.innerHTML=rmd(txt)+'<span class="cur"></span>';dwn()}
+if(ev==='token'){txt+=pl.delta;render(true);dwn()}
 else if(ev==='tool_start'){const x=addTool(pl.name,pl.args);x._args=pl.args;tbs.set(pl.id,x);dwn()}
 else if(ev==='tool_end'){const x=tbs.get(pl.id);if(x)finishTool(x,pl.result);dwn()}
-else if(ev==='media'){appendMedia(b,pl)}
-else if(ev==='error'){b.innerHTML='<span style="color:#ffb3bd">⚠️ '+esc(pl.message)+'</span>'}
+else if(ev==='media'){mediaPls.push(pl);render(true);dwn()}
+else if(ev==='error'){streamError=true;b.innerHTML='<span style="color:#ffb3bd">⚠️ '+esc(pl.message)+'</span>';dwn()}
 else if(ev==='done'){if(pl.conversation_id&&pl.conversation_id!==cid){cid=pl.conversation_id;markA();loadConvs()}
 $('#ct').textContent=p.slice(0,60)}}}
-b.innerHTML=rmd(txt||'*(no response)*');hl(b);dwn();loadConvs();markA();
+if(!streamError){if(txt.trim()||mediaPls.length)render(false);else b.innerHTML=rmd('*(no response)*')}
+hl(b);dwn();loadConvs();markA();
 }catch(e){b.innerHTML='<span style="color:#ffb3bd">⚠️ '+esc(e.message)+'</span>';toast(e.message,1)}
 finally{streaming=false;$('#send').disabled=false;$('#ip').focus()}}
 async function openConv(id,title){cid=id;$('#ct').textContent=title||'Chat';markA();clearTh();
