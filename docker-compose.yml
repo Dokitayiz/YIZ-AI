@@ -1,0 +1,108 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: yiz
+      POSTGRES_USER: yiz
+      POSTGRES_PASSWORD: yiz-dev-password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yiz -d yiz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["sleep 3; mc alias set local http://minio:9000 minio minio-password; mc mb --ignore-existing local/yiz-ai"]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      ENV: production
+      DATABASE_URL: postgresql://yiz:yiz-dev-password@postgres:5432/yiz
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: local-dev-change-me
+      MEDIA_STORAGE: s3
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: yiz-ai
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: minio
+      S3_SECRET_ACCESS_KEY: minio-password
+      S3_PREFIX: yiz-ai
+      ALLOWED_ORIGINS: http://localhost:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "worker.py"]
+    environment:
+      ENV: production
+      DATABASE_URL: postgresql://yiz:yiz-dev-password@postgres:5432/yiz
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: local-dev-change-me
+      MEDIA_STORAGE: s3
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: yiz-ai
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: minio
+      S3_SECRET_ACCESS_KEY: minio-password
+      S3_PREFIX: yiz-ai
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      YIZ_API_INTERNAL_URL: http://api:8000
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio-password
+    volumes:
+      - miniodata:/data
+    ports:
+      - "9001:9001"
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

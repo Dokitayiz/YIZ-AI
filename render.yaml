@@ -1,0 +1,141 @@
+services:
+  - type: pserv
+    name: yiz-api
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerCommand: sh -c 'exec uvicorn yiz_ai:app --host 0.0.0.0 --port ${PORT:-8000}'
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: yiz-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: yiz-redis
+          type: keyvalue
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MEDIA_STORAGE
+        value: s3
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_BUCKET
+        value: yiz-ai-production
+      - key: S3_REGION
+        value: auto
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_PREFIX
+        value: yiz-ai
+      - key: FRONTEND_URL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: LLM_PROVIDER
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: OLLAMA_BASE_URL
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: STABILITY_API_KEY
+        sync: false
+      - key: REPLICATE_API_TOKEN
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GITHUB_CLIENT_ID
+        sync: false
+      - key: GITHUB_CLIENT_SECRET
+        sync: false
+      - key: OAUTH_REDIRECT_BASE
+        sync: false
+
+  - type: worker
+    name: yiz-worker
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python worker.py
+    autoDeploy: true
+    maxShutdownDelaySeconds: 300
+    envVars:
+      - key: ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: yiz-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: yiz-redis
+          type: keyvalue
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MEDIA_STORAGE
+        value: s3
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_BUCKET
+        value: yiz-ai-production
+      - key: S3_REGION
+        value: auto
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_PREFIX
+        value: yiz-ai
+      - key: STABILITY_API_KEY
+        sync: false
+      - key: REPLICATE_API_TOKEN
+        sync: false
+
+  - type: keyvalue
+    name: yiz-redis
+    plan: 256mb
+    ipAllowList: []
+
+  - type: web
+    name: yiz-frontend
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: ./frontend
+    dockerCommand: nginx -g 'daemon off;'
+    autoDeploy: true
+    envVars:
+      - key: YIZ_API_INTERNAL_URL
+        fromService:
+          name: yiz-api
+          type: pserv
+          property: hostport
+
+databases:
+  - name: yiz-postgres
+    databaseName: yiz
+    user: yiz
+    plan: basic-256mb
+
+# Render Key Value is Redis-compatible and is used as the durable queue/cache.
+# The Blueprint currently provisions it alongside the services above.
+# Configure the instance size in the Render dashboard if the default is not sufficient.
+#
+# NOTE: Key Value resources are service entries, so this is intentionally under services.
+# It is kept separate here so the application service references remain obvious.

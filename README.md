@@ -29,3 +29,33 @@ rotating refresh tokens, media and document generation, and DuckDB analysis.
 
 Minimum: 512 MB RAM, 1 vCPU. Matplotlib and DuckDB are the memory-hungry paths.
 Floot-specific steps are in `FL00T.md`.
+
+
+## Production hardening in v4.1
+
+- Docker now listens on the platform-provided `PORT` instead of hard-coding 8000.
+- Container health checks follow the same runtime port.
+- Added `/api/ready` for dependency-aware readiness checks.
+- Added transient Postgres connection retries and serialized migrations.
+- Refresh-token consumption is atomic to reduce concurrent-reuse races.
+- Chat payloads and tool context are bounded to reduce accidental resource exhaustion.
+- MCP/tool failures are contained so one failing integration does not tear down the SSE stream.
+- Safer default CORS behavior: set `ALLOWED_ORIGINS` explicitly when using a separate frontend.
+- Added security headers and deployment documentation.
+- Added a Render Blueprint configuration.
+
+## Yiz AI 5.0 architecture
+
+The project now supports a split production topology:
+
+- `frontend/` — standalone Nginx UI with `/api/*` reverse proxy and SSE-safe settings.
+- `yiz_ai.py` — FastAPI API/orchestrator.
+- `worker.py` — Redis-backed background worker for heavy media/document jobs.
+- `job_queue.py` — queue/status client.
+- S3-compatible object storage — uploads and generated media.
+- Postgres — application state and media ownership metadata.
+- Redis/Render Key Value — rate limiting and worker queue.
+
+For local development, use `docker compose up --build` and open `http://localhost:8080`.
+
+For production, configure `MEDIA_STORAGE=s3` and the S3/R2 credentials. The included `render.yaml` provisions the frontend, private API, worker, Redis-compatible Key Value, and Postgres resources.

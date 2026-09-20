@@ -6,6 +6,7 @@ import ast
 import asyncio
 import base64
 import csv as _csv
+import contextvars
 import hashlib
 import importlib.util
 import io
@@ -74,7 +75,7 @@ COOKIE_ACCESS = "yiz_access"
 COOKIE_REFRESH = "yiz_refresh"
 
 CROSS_ORIGIN = os.getenv("CROSS_ORIGIN", "false").lower() in ("1", "true", "yes")
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
@@ -101,26 +102,44 @@ N8N_API_KEY = os.getenv("N8N_API_KEY", "")
 MCP_SERVERS = os.getenv("MCP_SERVERS", "")
 PLUGINS_DIR = Path(os.getenv("PLUGINS_DIR", "plugins"))
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "media"))
+MEDIA_CACHE_DIR = Path(os.getenv("MEDIA_CACHE_DIR", str(MEDIA_DIR / "cache")))
+MEDIA_STORAGE = os.getenv("MEDIA_STORAGE", "local").strip().lower()
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "").strip()
+S3_BUCKET = os.getenv("S3_BUCKET", "").strip()
+S3_REGION = os.getenv("S3_REGION", "auto").strip()
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "").strip()
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", "").strip()
+S3_PREFIX = os.getenv("S3_PREFIX", "yiz-ai").strip("/")
 MEDIA_MAX_BYTES = int(os.getenv("MEDIA_MAX_BYTES", 25 * 1024 * 1024))
 
 WEB_FETCH_MAX_REDIRECTS = 5
 WEB_FETCH_MAX_BYTES = 5 * 1024 * 1024
 MAX_CONTEXT_MESSAGES = int(os.getenv("MAX_CONTEXT_MESSAGES", 60))
 DUCKDB_ROW_LIMIT = 200
+DB_CONNECT_RETRIES = max(1, int(os.getenv("DB_CONNECT_RETRIES", 8)))
+DB_CONNECT_TIMEOUT_SEC = max(2, int(os.getenv("DB_CONNECT_TIMEOUT_SEC", 10)))
 
 
-def _ensure_dir(path: Path, label: str) -> None:
-    """Create a working directory, failing loudly for MEDIA_DIR."""
+def _ensure_dir(path: Path, label: str, required: bool = False) -> None:
+    """Create a working directory, optionally failing loudly."""
     try:
         path.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        if label == "MEDIA_DIR":
-            raise RuntimeError(f"MEDIA_DIR {path} is not writable: {exc}") from exc
+        if required:
+            raise RuntimeError(f"{label} {path} is not writable: {exc}") from exc
         log.warning("%s %s is not writable: %s", label, path, exc)
 
 
-_ensure_dir(MEDIA_DIR, "MEDIA_DIR")
+if MEDIA_STORAGE not in {"local", "s3"}:
+    raise RuntimeError("MEDIA_STORAGE must be 'local' or 's3'.")
+if MEDIA_STORAGE == "s3" and not S3_BUCKET:
+    raise RuntimeError("S3_BUCKET is required when MEDIA_STORAGE=s3.")
+_ensure_dir(MEDIA_DIR, "MEDIA_DIR", required=MEDIA_STORAGE == "local")
+_ensure_dir(MEDIA_CACHE_DIR, "MEDIA_CACHE_DIR", required=False)
 _ensure_dir(PLUGINS_DIR, "PLUGINS_DIR")
+
+# Request-local identity used by media storage and background jobs.
+CURRENT_USER_ID: contextvars.ContextVar[str] = contextvars.ContextVar("yiz_user_id", default="system")
 
 RL_LOGIN_PER_MIN = int(os.getenv("RL_LOGIN_PER_MIN", 8))
 RL_SIGNUP_PER_MIN = int(os.getenv("RL_SIGNUP_PER_MIN", 4))
@@ -242,25 +261,42 @@ MIGRATIONS = [
         CREATE INDEX IF NOT EXISTS idx_attachments_user
             ON attachments(user_id, created_at DESC);
     """),
+    (5, "media_metadata", """
+        CREATE TABLE IF NOT EXISTS media_objects (
+            stored_name TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            content_type TEXT,
+            size_bytes BIGINT,
+            original_name TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_accessed_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_media_objects_user
+            ON media_objects(user_id, created_at DESC);
+    """),
 ]
 
 
 async def run_migrations(conn: asyncpg.Connection) -> None:
-    """Apply any unapplied migrations, each in its own transaction."""
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS _schema_version (
-            version INT PRIMARY KEY,
-            name TEXT NOT NULL,
-            applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
-    current = await conn.fetchval("SELECT COALESCE(MAX(version),0) FROM _schema_version")
-    for version, name, sql in MIGRATIONS:
-        if version <= current:
-            continue
-        log.info("applying migration v%03d %s", version, name)
-        async with conn.transaction():
-            await conn.execute(sql)
-            await conn.execute("INSERT INTO _schema_version (version, name) VALUES ($1,$2)",
-                               version, name)
+    """Apply unapplied migrations while serializing startup across replicas."""
+    await conn.execute("SELECT pg_advisory_lock(874321009)")
+    try:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS _schema_version (
+                version INT PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+        current = await conn.fetchval("SELECT COALESCE(MAX(version),0) FROM _schema_version")
+        for version, name, sql in MIGRATIONS:
+            if version <= current:
+                continue
+            log.info("applying migration v%03d %s", version, name)
+            async with conn.transaction():
+                await conn.execute(sql)
+                await conn.execute("INSERT INTO _schema_version (version, name) VALUES ($1,$2)",
+                                   version, name)
+    finally:
+        await conn.execute("SELECT pg_advisory_unlock(874321009)")
 
 
 # ---------------- DATABASE ----------------
@@ -279,11 +315,27 @@ class Database:
         self.pool: Optional[asyncpg.Pool] = None
 
     async def connect(self) -> None:
-        """Open the pool and bring the schema up to date."""
-        self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=10,
-                                              command_timeout=30)
-        async with self.pool.acquire() as conn:
-            await run_migrations(conn)
+        """Open the pool and bring the schema up to date, retrying transient DB startup failures."""
+        last_error: Optional[Exception] = None
+        for attempt in range(DB_CONNECT_RETRIES):
+            try:
+                self.pool = await asyncpg.create_pool(
+                    self.dsn, min_size=1, max_size=10,
+                    command_timeout=30, timeout=DB_CONNECT_TIMEOUT_SEC)
+                async with self.pool.acquire() as conn:
+                    await run_migrations(conn)
+                log.info("database connected")
+                return
+            except Exception as exc:
+                last_error = exc
+                if self.pool:
+                    await self.pool.close()
+                    self.pool = None
+                delay = min(2 ** attempt, 10)
+                log.warning("database connection attempt %d/%d failed: %s; retrying in %ss",
+                            attempt + 1, DB_CONNECT_RETRIES, exc, delay)
+                await asyncio.sleep(delay)
+        raise RuntimeError(f"database unavailable after {DB_CONNECT_RETRIES} attempts: {last_error}")
 
     async def close(self) -> None:
         """Close the connection pool."""
@@ -483,12 +535,13 @@ class Database:
                    FROM refresh_tokens WHERE token_hash=$1""", token_hash)
         return dict(row) if row else None
 
-    async def mark_refresh_used(self, token_hash: str, new_hash: str) -> None:
-        """Mark a refresh token consumed and record its replacement."""
+    async def mark_refresh_used(self, token_hash: str, new_hash: str) -> bool:
+        """Atomically consume a refresh token; returns False if already consumed."""
         async with self.pool.acquire() as c:
-            await c.execute(
+            result = await c.execute(
                 """UPDATE refresh_tokens SET used_at=NOW(),replaced_by=$1
-                   WHERE token_hash=$2""", new_hash, token_hash)
+                   WHERE token_hash=$2 AND used_at IS NULL""", new_hash, token_hash)
+        return result.endswith("1")
 
     async def add_attachment(self, uid: str, filename: Optional[str], stored: str,
                              ctype: Optional[str], size: int) -> str:
@@ -517,6 +570,35 @@ class Database:
                 """SELECT id,filename,stored_name,content_type,size_bytes
                    FROM attachments WHERE id=$1 AND user_id=$2""", aid, uid)
         return dict(row) if row else None
+
+    async def register_media(self, stored_name: str, uid: str, size: int,
+                             content_type: Optional[str] = None,
+                             original_name: Optional[str] = None) -> None:
+        """Register an object so media access is scoped to its owner."""
+        async with self.pool.acquire() as c:
+            await c.execute(
+                """INSERT INTO media_objects
+                   (stored_name,user_id,content_type,size_bytes,original_name)
+                   VALUES ($1,$2,$3,$4,$5)
+                   ON CONFLICT (stored_name) DO UPDATE SET
+                     size_bytes=EXCLUDED.size_bytes, content_type=EXCLUDED.content_type,
+                     original_name=EXCLUDED.original_name""",
+                stored_name, uid, content_type, size, original_name)
+
+    async def get_media(self, stored_name: str, uid: str) -> Optional[dict]:
+        """Fetch metadata for an object owned by the caller, including legacy uploads."""
+        async with self.pool.acquire() as c:
+            row = await c.fetchrow(
+                """SELECT stored_name,user_id,content_type,size_bytes,original_name
+                   FROM media_objects WHERE stored_name=$1 AND user_id=$2""",
+                stored_name, uid)
+            if row:
+                return dict(row)
+            legacy = await c.fetchrow(
+                """SELECT stored_name,user_id,content_type,size_bytes,filename AS original_name
+                   FROM attachments WHERE stored_name=$1 AND user_id=$2
+                   LIMIT 1""", stored_name, uid)
+        return dict(legacy) if legacy else None
 
 
 db = Database(DATABASE_URL)
@@ -580,37 +662,129 @@ rate_limiter = RateLimiter()
 
 # ---------------- MEDIA STORE ----------------
 class MediaStore:
-    """Size-capped file store for generated and uploaded media."""
+    """Unified local/S3-compatible object store with a small local analysis cache."""
     def __init__(self, root: Path) -> None:
-        """Store the media root."""
         self.root = root
+        self.cache = MEDIA_CACHE_DIR
+        self.s3 = None
+        if MEDIA_STORAGE == "s3":
+            try:
+                import boto3
+                from botocore.config import Config
+            except ImportError as exc:
+                raise RuntimeError("boto3 is required when MEDIA_STORAGE=s3") from exc
+            self.s3 = boto3.client(
+                "s3",
+                endpoint_url=S3_ENDPOINT_URL or None,
+                region_name=S3_REGION or None,
+                aws_access_key_id=S3_ACCESS_KEY_ID or None,
+                aws_secret_access_key=S3_SECRET_ACCESS_KEY or None,
+                config=Config(signature_version="s3v4", retries={"max_attempts": 4, "mode": "standard"}),
+            )
 
-    def save_bytes(self, data: bytes, ext: str) -> str:
-        """Write bytes under a random name, enforcing the size cap."""
-        if len(data) > MEDIA_MAX_BYTES:
-            raise ValueError(f"file exceeds {MEDIA_MAX_BYTES} bytes")
+    @staticmethod
+    def _safe_key(key: str) -> str:
+        key = str(key or "").replace("\\", "/").lstrip("/")
+        parts = [p for p in key.split("/") if p not in ("", ".")]
+        if not parts or any(p == ".." for p in parts):
+            raise ValueError("invalid media key")
+        return "/".join(parts)
+
+    def _key(self, ext: str) -> str:
+        owner = re.sub(r"[^a-zA-Z0-9_-]", "", CURRENT_USER_ID.get())[:80] or "system"
         ext = (ext or "bin").lstrip(".").lower()[:10]
         name = f"{uuid.uuid4().hex}.{ext}"
-        (self.root / name).write_bytes(data)
-        return name
+        return f"{S3_PREFIX}/{owner}/{name}" if S3_PREFIX else f"{owner}/{name}"
+
+    def _local_path(self, key: str) -> Path:
+        # Strip the object-store prefix so local fallback remains portable.
+        clean = self._safe_key(key)
+        if S3_PREFIX and clean.startswith(S3_PREFIX + "/"):
+            clean = clean[len(S3_PREFIX) + 1:]
+        p = (self.root / clean).resolve()
+        p.relative_to(self.root.resolve())
+        return p
+
+    def save_bytes(self, data: bytes, ext: str, content_type: Optional[str] = None,
+                   original_name: Optional[str] = None) -> str:
+        if len(data) > MEDIA_MAX_BYTES:
+            raise ValueError(f"file exceeds {MEDIA_MAX_BYTES} bytes")
+        key = self._key(ext)
+        if MEDIA_STORAGE == "local":
+            p = self._local_path(key)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+        else:
+            ctype = content_type or mimetypes.guess_type(key)[0] or "application/octet-stream"
+            self.s3.put_object(Bucket=S3_BUCKET, Key=self._safe_key(key), Body=data,
+                               ContentType=ctype, CacheControl="private, max-age=31536000")
+        return key
 
     def save_b64(self, b64_data: str, ext: str) -> str:
-        """Decode base64 and store the result."""
         return self.save_bytes(base64.b64decode(b64_data), ext)
 
     def path(self, filename: str) -> Optional[Path]:
-        """Resolve a stored name to a file inside the media root."""
-        name = Path(filename).name
-        p = self.root / name
-        return p if p.exists() and p.is_file() else None
+        """Return a local path, materializing an S3 object into the analysis cache when needed."""
+        try:
+            key = self._safe_key(filename)
+        except ValueError:
+            return None
+        if MEDIA_STORAGE == "local":
+            try:
+                p = self._local_path(key)
+            except (OSError, ValueError):
+                return None
+            return p if p.exists() and p.is_file() else None
+        cache_name = hashlib.sha256(key.encode()).hexdigest() + "_" + Path(key).name
+        cached = self.cache / cache_name
+        if cached.exists() and cached.is_file():
+            return cached
+        try:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            self.s3.download_file(S3_BUCKET, key, str(cached))
+            return cached
+        except Exception as exc:
+            log.warning("media materialization failed for %s: %s", key, exc)
+            try:
+                cached.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
 
     def read(self, filename: str) -> Optional[bytes]:
-        """Read a stored file, or None when it is missing."""
         p = self.path(filename)
         return p.read_bytes() if p else None
 
+    def delete(self, filename: str) -> None:
+        try:
+            key = self._safe_key(filename)
+        except ValueError:
+            return
+        if MEDIA_STORAGE == "local":
+            try:
+                self._local_path(key).unlink(missing_ok=True)
+            except OSError:
+                pass
+        else:
+            try:
+                self.s3.delete_object(Bucket=S3_BUCKET, Key=key)
+            except Exception as exc:
+                log.warning("media deletion failed for %s: %s", key, exc)
+
 
 media_store = MediaStore(MEDIA_DIR)
+
+
+async def store_media(data: bytes, ext: str, content_type: Optional[str] = None,
+                      original_name: Optional[str] = None) -> str:
+    """Persist media and register ownership metadata."""
+    stored = await asyncio.to_thread(media_store.save_bytes, data, ext, content_type, original_name)
+    try:
+        await db.register_media(stored, CURRENT_USER_ID.get(), len(data), content_type, original_name)
+    except Exception:
+        # The object remains recoverable; a later cleanup job can remove unregistered objects.
+        log.exception("failed to register media metadata for %s", stored)
+    return stored
 
 
 # ---------------- AUTH ----------------
@@ -1537,7 +1711,7 @@ def hash_text(text: str, algorithm: str = "sha256") -> dict[str, str]:
     return {"algorithm": algorithm, "hash": h.hexdigest()}
 
 
-def generate_qr(text: str, size: int = 8) -> dict[str, str]:
+async def generate_qr(text: str, size: int = 8) -> dict[str, str]:
     """Render a QR code PNG and store it."""
     import qrcode
     qr = qrcode.QRCode(box_size=size, border=2)
@@ -1546,7 +1720,7 @@ def generate_qr(text: str, size: int = 8) -> dict[str, str]:
     img = qr.make_image(fill_color="black", back_color="white")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    stored = media_store.save_bytes(buf.getvalue(), "png")
+    stored = await store_media(buf.getvalue(), "png", "image/png")
     return {"text": text, "image_url": f"/api/media/{stored}"}
 
 
@@ -1567,7 +1741,7 @@ async def _generate_image(prompt: str, width: int = 1024, height: int = 1024,
                           "width": width, "height": height})
             if r.status_code != 200:
                 return {"error": f"stability {r.status_code}"}
-            stored = media_store.save_bytes(r.content, "png")
+            stored = await store_media(r.content, "png", "image/png")
             return {"provider": "stability", "prompt": full,
                     "image_url": f"/api/media/{stored}", "width": width, "height": height}
         except httpx.HTTPError as e:
@@ -1579,7 +1753,7 @@ async def _generate_image(prompt: str, width: int = 1024, height: int = 1024,
             r = await c.get(url)
         if r.status_code != 200:
             return {"error": f"pollinations {r.status_code}"}
-        stored = media_store.save_bytes(r.content, "png")
+        stored = await store_media(r.content, "png", "image/png")
         return {"provider": "pollinations", "prompt": full,
                 "image_url": f"/api/media/{stored}", "width": width, "height": height}
     except httpx.HTTPError as e:
@@ -1597,7 +1771,7 @@ async def _text_to_speech(text: str, lang: str = "en") -> dict[str, Any]:
                 headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
             return {"error": f"tts {r.status_code}"}
-        stored = media_store.save_bytes(r.content, "mp3")
+        stored = await store_media(r.content, "mp3", "audio/mpeg")
         return {"text": text, "lang": lang, "audio_url": f"/api/media/{stored}"}
     except httpx.HTTPError as e:
         return {"error": f"tts failed: {e}"}
@@ -1628,7 +1802,7 @@ async def _generate_video(prompt: str, duration: int = 3) -> dict[str, Any]:
             url = data["output"][0] if isinstance(data["output"], list) else data["output"]
             async with httpx.AsyncClient(timeout=60) as c:
                 v = await c.get(url)
-            stored = media_store.save_bytes(v.content, "mp4")
+            stored = await store_media(v.content, "mp4", "video/mp4")
             return {"provider": "replicate", "prompt": prompt,
                     "video_url": f"/api/media/{stored}"}
         if data["status"] == "failed":
@@ -1652,7 +1826,7 @@ async def _generate_text_file(filename: Optional[str], content: str, **_: Any) -
     if len(data) > MEDIA_MAX_BYTES:
         return {"error": f"file too large ({len(data)} bytes)"}
     ext = Path(safe).suffix.lstrip(".")
-    stored = media_store.save_bytes(data, ext)
+    stored = await store_media(data, ext, mimetypes.guess_type(safe)[0], safe)
     return {"filename": safe, "size": len(data),
             "download_url": f"/api/media/{stored}?name={quote(safe)}"}
 
@@ -1711,7 +1885,7 @@ async def _generate_pdf(filename: Optional[str], title: str, sections: Optional[
         flow.append(Spacer(1, 12))
     doc.build(flow)
     data = buf.getvalue()
-    stored = media_store.save_bytes(data, "pdf")
+    stored = await store_media(data, "pdf", "application/pdf", fname)
     fname = _safe_name(filename or "document.pdf", "pdf")
     return {"filename": fname, "size": len(data),
             "download_url": f"/api/media/{stored}?name={quote(fname)}"}
@@ -1745,7 +1919,7 @@ async def _generate_xlsx(filename: Optional[str], sheets: Optional[list],
     buf = io.BytesIO()
     wb.save(buf)
     data = buf.getvalue()
-    stored = media_store.save_bytes(data, "xlsx")
+    stored = await store_media(data, "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", fname)
     fname = _safe_name(filename or "workbook.xlsx", "xlsx")
     return {"filename": fname, "size": len(data),
             "download_url": f"/api/media/{stored}?name={quote(fname)}"}
@@ -1772,7 +1946,7 @@ async def _generate_docx(filename: Optional[str], title: str,
     buf = io.BytesIO()
     doc.save(buf)
     data = buf.getvalue()
-    stored = media_store.save_bytes(data, "docx")
+    stored = await store_media(data, "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", fname)
     fname = _safe_name(filename or "document.docx", "docx")
     return {"filename": fname, "size": len(data),
             "download_url": f"/api/media/{stored}?name={quote(fname)}"}
@@ -1818,7 +1992,7 @@ async def _make_chart(chart_type: str, title: str, x: list, y: list,
     fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
     plt.close(fig)
     data = buf.getvalue()
-    stored = media_store.save_bytes(data, "png")
+    stored = await store_media(data, "png", "image/png")
     return {"chart_type": ct, "title": title,
             "image_url": f"/api/media/{stored}"}
 
@@ -1828,16 +2002,10 @@ _DUCK_READERS = {"csv": "read_csv_auto", "parquet": "read_parquet",
 
 
 def _resolve_source(source: str) -> Optional[Path]:
-    """Map a caller-supplied source name onto a file inside MEDIA_DIR."""
+    """Materialize a caller-supplied object through the media abstraction."""
     if not source or len(source) > 260:
         return None
-    candidate = MEDIA_DIR / Path(source).name
-    try:
-        candidate = candidate.resolve()
-        candidate.relative_to(MEDIA_DIR.resolve())
-    except (OSError, ValueError):
-        return None
-    return candidate if candidate.is_file() else None
+    return media_store.path(source)
 
 
 def _duck_load(con: Any, path: Path) -> None:
@@ -1965,7 +2133,7 @@ class ToolRegistry:
           {"type": "object", "properties": {"text": {"type": "string"},
                                             "size": {"type": "integer"}},
            "required": ["text"]},
-          lambda text, size=8: generate_qr(text, size))
+          generate_qr, is_async=True)
         R("run_code",
           "Execute code in a sandbox. Languages: python, javascript, typescript, "
           "go, rust, java, c, cpp, csharp, bash, ruby, php, sql, kotlin, swift, lua.",
@@ -2505,7 +2673,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await db.close()
 
 
-app = FastAPI(title="Yiz AI", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="Yiz AI", version="5.0.0", lifespan=lifespan)
 
 if ALLOWED_ORIGINS in ([], ["*"]):
     app.add_middleware(CORSMiddleware, allow_origin_regex=".*",
@@ -2524,6 +2692,9 @@ async def security_headers(request: Request, call_next: Callable) -> Response:
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("X-XSS-Protection", "0")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("X-Robots-Tag", "noindex, nofollow")
     return response
 
 
@@ -2542,15 +2713,15 @@ class LoginBody(BaseModel):
 
 class ChatRequest(BaseModel):
     """Payload for a plain chat turn."""
-    prompt: str
+    prompt: str = Field(min_length=1, max_length=20000)
     conversation_id: Optional[str] = None
 
 
 class ChatWithFilesRequest(BaseModel):
     """Payload for a chat turn that references uploaded attachments."""
-    prompt: str
+    prompt: str = Field(min_length=1, max_length=20000)
     conversation_id: Optional[str] = None
-    attachment_ids: list[str] = []
+    attachment_ids: list[str] = Field(default_factory=list, max_length=5)
 
 
 async def _optional_user(request: Request) -> Optional[dict]:
@@ -2568,20 +2739,26 @@ async def _optional_user(request: Request) -> Optional[dict]:
 
 
 @app.get("/api/health")
-async def health(request: Request) -> dict[str, Any]:
-    """Report liveness; configuration detail only for signed-in callers."""
+async def health() -> dict[str, Any]:
+    """Lightweight liveness endpoint for platform health checks."""
+    return {"ok": True, "service": "yiz-ai", "version": "5.0.0"}
+
+@app.get("/api/ready")
+async def ready() -> Response:
+    """Readiness endpoint: DB and an LLM provider must be configured."""
+    if db.pool is None:
+        return Response(
+            content=json.dumps({"ok": False, "error": "database not connected"}),
+            status_code=503, media_type="application/json")
     try:
         provider, model = pick_provider()
-    except LLMError as e:
-        return {"ok": False, "error": str(e)}
-    body: dict[str, Any] = {"ok": True, "provider": provider, "model": model,
-                            "sandbox": SANDBOX_PROVIDER}
-    if await _optional_user(request):
-        body.update({"tools": [s["name"] for s in tools.schemas()],
-                     "n8n": n8n_client.enabled,
-                     "mcp": mcp_client.list_servers(),
-                     "plugins": [p["name"] for p in plugin_loader.loaded]})
-    return body
+    except LLMError as exc:
+        return Response(
+            content=json.dumps({"ok": False, "error": str(exc)}),
+            status_code=503, media_type="application/json")
+    return Response(
+        content=json.dumps({"ok": True, "provider": provider, "model": model}),
+        status_code=200, media_type="application/json")
 
 
 @app.get("/api/auth/providers")
@@ -2667,7 +2844,11 @@ async def refresh(response: Response,
     if not user or not user["is_active"]:
         raise HTTPException(401, "user not found")
     raw, new_hash = new_refresh_token()
-    await db.mark_refresh_used(hashed, new_hash)
+    consumed = await db.mark_refresh_used(hashed, new_hash)
+    if not consumed:
+        await db.revoke_session(sess["id"])
+        clear_auth_cookies(response)
+        raise HTTPException(401, "refresh token reuse detected")
     await db.store_refresh(sess["id"], new_hash, REFRESH_TTL_DAYS)
     set_auth_cookies(response, make_access_token(user["id"], sess["id"]), raw)
     return {"ok": True}
@@ -2761,7 +2942,11 @@ async def upload(file: UploadFile = FastFile(...),
         raise HTTPException(413, f"file exceeds {MEDIA_MAX_BYTES} bytes")
     safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", file.filename or "upload.bin")[:150]
     ext = Path(safe_name).suffix.lstrip(".").lower() or "bin"
-    stored = media_store.save_bytes(data, ext)
+    token = CURRENT_USER_ID.set(user["id"])
+    try:
+        stored = await store_media(data, ext, file.content_type or "application/octet-stream", safe_name)
+    finally:
+        CURRENT_USER_ID.reset(token)
     aid = await db.add_attachment(user["id"], safe_name, stored,
                                   file.content_type or "application/octet-stream",
                                   len(data))
@@ -2776,16 +2961,23 @@ async def list_attachments(user: dict = Depends(get_current_user)) -> dict[str, 
     return {"attachments": await db.list_attachments(user["id"])}
 
 
-@app.get("/api/media/{stored}")
+@app.get("/api/media/{stored:path}")
 async def serve_media(stored: str, name: Optional[str] = Query(default=None),
                       user: dict = Depends(get_current_user)) -> FileResponse:
-    """Stream a stored media file to an authenticated caller."""
-    p = media_store.path(stored)
+    """Stream a stored media file only to its owning user."""
+    try:
+        key = media_store._safe_key(stored)
+    except ValueError:
+        raise HTTPException(404, "not found")
+    meta = await db.get_media(key, user["id"])
+    if not meta:
+        raise HTTPException(404, "not found")
+    p = media_store.path(key)
     if not p:
         raise HTTPException(404, "not found")
-    safe = _safe_name(name, "bin") if name else None
-    ctype = mimetypes.guess_type(safe or stored)[0] or "application/octet-stream"
-    headers = {"X-Content-Type-Options": "nosniff"}
+    safe = _safe_name(name or meta.get("original_name"), "bin") if (name or meta.get("original_name")) else None
+    ctype = meta.get("content_type") or mimetypes.guess_type(safe or key)[0] or "application/octet-stream"
+    headers = {"X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=3600"}
     if safe:
         headers["Content-Disposition"] = f'inline; filename="{safe}"'
     return FileResponse(p, media_type=ctype, headers=headers)
@@ -2832,6 +3024,24 @@ def _trim_history(history: list[dict]) -> list[dict]:
     return window
 
 
+HEAVY_WORKER_TOOLS = {
+    "generate_image", "generate_video", "text_to_speech",
+    "generate_text_file", "generate_csv", "generate_json_file", "generate_markdown_file",
+    "generate_pdf", "generate_xlsx", "generate_docx", "make_chart", "generate_qr",
+}
+
+
+async def dispatch_tool(name: str, args: dict[str, Any], user_id: str) -> str:
+    """Run heavy media work in Redis worker when available, otherwise locally."""
+    if name in HEAVY_WORKER_TOOLS and REDIS_URL:
+        from job_queue import enqueue_and_wait, worker_available
+        if await worker_available():
+            result = await enqueue_and_wait(name, args, user_id=user_id)
+            return json.dumps(result, default=str)
+        log.warning("no fresh worker heartbeat; executing %s locally", name)
+    return await tools.call(name, args, user_id=user_id)
+
+
 async def agent_stream(prompt: str, cid: str,
                        user_id: str) -> AsyncGenerator[str, None]:
     """Run the tool-calling loop for one turn, emitting SSE frames."""
@@ -2873,11 +3083,21 @@ async def agent_stream(prompt: str, cid: str,
         for call in calls:
             yield sse("tool_start", {"id": call["id"], "name": call["name"],
                                      "args": call["args"]})
-            if call["name"].startswith("mcp__"):
-                _, server, tool = call["name"].split("__", 2)
-                result = json.dumps(await mcp_client.call_tool(server, tool, call["args"]))
-            else:
-                result = await tools.call(call["name"], call["args"], user_id=user_id)
+            try:
+                if call["name"].startswith("mcp__"):
+                    _, server, tool = call["name"].split("__", 2)
+                    result = json.dumps(await mcp_client.call_tool(server, tool, call["args"]))
+                else:
+                    token = CURRENT_USER_ID.set(user_id)
+                    try:
+                        result = await dispatch_tool(call["name"], call["args"], user_id)
+                    finally:
+                        CURRENT_USER_ID.reset(token)
+            except Exception as exc:
+                log.exception("tool %s failed during agent loop", call["name"])
+                result = json.dumps({"error": f"tool execution failed: {type(exc).__name__}: {exc}"})
+            # Keep model context bounded even if an external/MCP tool returns a huge payload.
+            result = result[:20000]
 
             media_event = None
             try:
@@ -2978,9 +3198,11 @@ async def chat_with_files(body: ChatWithFilesRequest,
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> str:
-    """Serve the single-page frontend."""
-    return FRONTEND_HTML
+async def index() -> Response:
+    """Serve the embedded frontend in single-service mode or redirect to the standalone UI."""
+    if FRONTEND_URL:
+        return RedirectResponse(FRONTEND_URL)
+    return HTMLResponse(FRONTEND_HTML)
 
 
 if __name__ == "__main__":
