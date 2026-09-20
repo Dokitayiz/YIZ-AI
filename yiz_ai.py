@@ -9,6 +9,7 @@ import csv as _csv
 import contextvars
 import hashlib
 import importlib.util
+import inspect
 import io
 import ipaddress
 import json
@@ -90,6 +91,13 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 # anthropic | openai | ollama | "" (auto: anthropic, then openai, then ollama)
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()
+# Allow callers to pick any model the configured providers expose.
+ALLOW_MODEL_OVERRIDE = os.getenv("ALLOW_MODEL_OVERRIDE", "true").lower() in ("1", "true", "yes")
+MODEL_LIST_TTL = int(os.getenv("MODEL_LIST_TTL", 300))
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1").rstrip("/")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+ANTHROPIC_VERSION = os.getenv("ANTHROPIC_VERSION", "2023-06-01")
+ANTHROPIC_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", 4096))
 
 SANDBOX_PROVIDER = os.getenv("SANDBOX_PROVIDER", "piston").lower()
 PISTON_URL = os.getenv("PISTON_URL", "https://emkc.org/api/v2/piston").rstrip("/")
@@ -100,6 +108,9 @@ SANDBOX_RUNS_PER_MIN = int(os.getenv("SANDBOX_RUNS_PER_MIN", 10))
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "").rstrip("/")
 N8N_API_KEY = os.getenv("N8N_API_KEY", "")
 MCP_SERVERS = os.getenv("MCP_SERVERS", "")
+MCP_ALLOW_PRIVATE = os.getenv("MCP_ALLOW_PRIVATE", "false").lower() in ("1", "true", "yes")
+MCP_MAX_RESPONSE_BYTES = int(os.getenv("MCP_MAX_RESPONSE_BYTES", 2_000_000))
+MCP_TIMEOUT = float(os.getenv("MCP_TIMEOUT", 30))
 PLUGINS_DIR = Path(os.getenv("PLUGINS_DIR", "plugins"))
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "media"))
 MEDIA_CACHE_DIR = Path(os.getenv("MEDIA_CACHE_DIR", str(MEDIA_DIR / "cache")))
@@ -1091,15 +1102,67 @@ n8n_client = N8NClient()
 
 
 # ---------------- MCP ----------------
+def _validate_mcp_url(name: str, raw: str) -> Optional[str]:
+    """Return a safe absolute MCP base URL, or None when the entry is rejected."""
+    url = (raw or "").strip().rstrip("/")
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError as e:
+        log.warning("MCP server %s rejected: malformed URL (%s)", name, e)
+        return None
+    if parsed.scheme not in ("http", "https"):
+        log.warning("MCP server %s rejected: scheme %r not allowed", name, parsed.scheme)
+        return None
+    if not parsed.hostname:
+        log.warning("MCP server %s rejected: no hostname", name)
+        return None
+    if IS_PROD and parsed.scheme != "https" and not MCP_ALLOW_PRIVATE:
+        log.warning("MCP server %s rejected: https required in production", name)
+        return None
+    if not MCP_ALLOW_PRIVATE:
+        host = parsed.hostname.lower()
+        if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
+            log.warning("MCP server %s rejected: localhost not allowed", name)
+            return None
+        addresses = []
+        try:
+            addresses.append(ipaddress.ip_address(host))
+        except ValueError:
+            try:
+                infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80),
+                                           proto=socket.IPPROTO_TCP)
+                addresses = [ipaddress.ip_address(i[4][0]) for i in infos]
+            except (socket.gaierror, ValueError) as e:
+                log.warning("MCP server %s rejected: cannot resolve %s (%s)", name, host, e)
+                return None
+        for ip in addresses:
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                log.warning("MCP server %s rejected: %s resolves to non-public %s", name, host, ip)
+                return None
+    return url
+
+
 class MCPClient:
     """Minimal JSON-RPC client for configured MCP servers."""
     def __init__(self) -> None:
-        """Parse the configured name=url server list."""
+        """Parse and validate the configured name=url server list."""
         self.servers = {}
+        self.rejected = {}
         for entry in MCP_SERVERS.split(","):
-            if "=" in entry:
-                name, url = entry.split("=", 1)
-                self.servers[name.strip()] = url.strip().rstrip("/")
+            if "=" not in entry:
+                continue
+            name, url = entry.split("=", 1)
+            name = name.strip()
+            if not name:
+                continue
+            safe = _validate_mcp_url(name, url)
+            if safe:
+                self.servers[name] = safe
+            else:
+                self.rejected[name] = url.strip()
         self._cache = {}
 
     def list_servers(self) -> list[str]:
@@ -1107,37 +1170,56 @@ class MCPClient:
         return list(self.servers.keys())
 
     async def _rpc(self, server: str, method: str, params: dict) -> dict[str, Any]:
-        """Send one JSON-RPC call to a configured server; never raises."""
+        """Send one JSON-RPC call to a configured server."""
         if server not in self.servers:
+            if server in self.rejected:
+                return {"error": f"MCP server {server!r} was rejected by URL validation"}
             return {"error": f"unknown MCP server: {server}"}
         url = f"{self.servers[server]}/mcp"
-        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        payload = {"jsonrpc": "2.0", "id": uuid.uuid4().hex,
+                   "method": method, "params": params}
         try:
-            async with httpx.AsyncClient(timeout=30) as c:
+            async with httpx.AsyncClient(timeout=MCP_TIMEOUT, follow_redirects=False) as c:
                 r = await c.post(url, json=payload,
                                  headers={"Content-Type": "application/json",
                                           "Accept": "application/json"})
-            data = r.json()
+                r.raise_for_status()
+                body = await r.aread()
+        except httpx.HTTPStatusError as e:
+            detail = ""
+            try:
+                detail = e.response.text[:300]
+            except Exception:
+                pass
+            log.warning("MCP %s %s -> HTTP %s", server, method, e.response.status_code)
+            return {"error": f"MCP server returned HTTP {e.response.status_code}",
+                    "detail": detail}
         except httpx.HTTPError as e:
-            log.warning("MCP %s %s failed: %s", server, method, e)
             return {"error": f"MCP call failed: {e}"}
-        except (json.JSONDecodeError, ValueError) as e:
-            log.warning("MCP %s %s returned invalid JSON: %s", server, method, e)
-            return {"error": "MCP server returned an invalid response"}
+
+        if len(body) > MCP_MAX_RESPONSE_BYTES:
+            return {"error": f"MCP response too large ({len(body)} bytes)"}
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            return {"error": f"MCP response was not valid JSON: {e}"}
         if not isinstance(data, dict):
-            log.warning("MCP %s %s returned a non-object response", server, method)
-            return {"error": "MCP server returned an invalid response"}
+            return {"error": "MCP response was not a JSON-RPC object"}
+        if isinstance(data.get("error"), dict):
+            err = data["error"]
+            return {"error": f"MCP error {err.get('code')}: {err.get('message')}"}
         return data
 
     async def list_tools(self, server: str) -> list[dict]:
-        """List a server's tools, cached per process; malformed schemas are dropped."""
+        """List a server's tools, cached per process."""
         if server in self._cache:
             return self._cache[server]
         resp = await self._rpc(server, "tools/list", {})
-        raw = (resp.get("result") or {}).get("tools", [])
-        if not isinstance(raw, list):
-            raw = []
-        tools = [t for t in raw if isinstance(t, dict) and isinstance(t.get("name"), str)]
+        if "error" in resp:
+            log.warning("MCP tools/list failed for %s: %s", server, resp["error"])
+            return []
+        tools = (resp.get("result") or {}).get("tools", []) or []
+        tools = [t for t in tools if isinstance(t, dict) and t.get("name")]
         self._cache[server] = tools
         return tools
 
@@ -1150,21 +1232,14 @@ class MCPClient:
         return resp.get("result", {})
 
     async def all_tools(self) -> list[dict]:
-        """Every MCP tool across servers, namespaced for the model.
-
-        One server's failure never blocks the others or the caller."""
+        """Every MCP tool across servers, namespaced for the model."""
         out = []
         for server in self.servers:
-            try:
-                server_tools = await self.list_tools(server)
-            except Exception as e:
-                log.warning("MCP %s discovery failed: %s", server, e)
-                continue
-            for t in server_tools:
+            for t in await self.list_tools(server):
                 out.append({"server": server,
                             "name": f"mcp__{server}__{t['name']}",
                             "description": t.get("description", ""),
-                            "input_schema": t.get("inputSchema") or {"type": "object"}})
+                            "input_schema": t.get("inputSchema", {"type": "object"})})
         return out
 
 
@@ -1341,12 +1416,18 @@ class LLMError(Exception):
 _PROVIDERS: dict[str, tuple[bool, str]] = {
     "anthropic": (bool(ANTHROPIC_API_KEY), ANTHROPIC_MODEL),
     "openai": (bool(OPENAI_API_KEY), OPENAI_MODEL),
-    "ollama": (bool(OLLAMA_BASE_URL), OLLAMA_MODEL),
+    "ollama": (bool(OLLAMA_BASE_URL or OLLAMA_API_KEY), OLLAMA_MODEL),
 }
+_PROVIDER_ORDER = ("anthropic", "openai", "ollama")
+
+
+def configured_providers() -> list[str]:
+    """Names of every provider that has credentials in this environment."""
+    return [n for n in _PROVIDER_ORDER if _PROVIDERS[n][0]]
 
 
 def pick_provider() -> tuple[str, str]:
-    """Choose the LLM provider: LLM_PROVIDER if set, else anthropic > openai > ollama."""
+    """Choose the default provider: LLM_PROVIDER if set, else anthropic > openai > ollama."""
     if LLM_PROVIDER:
         if LLM_PROVIDER not in _PROVIDERS:
             raise LLMError(f"LLM_PROVIDER={LLM_PROVIDER!r} is not a known provider.")
@@ -1354,11 +1435,119 @@ def pick_provider() -> tuple[str, str]:
         if not configured:
             raise LLMError(f"LLM_PROVIDER={LLM_PROVIDER!r} has no credentials set.")
         return LLM_PROVIDER, model
-    for name in ("anthropic", "openai", "ollama"):
+    for name in _PROVIDER_ORDER:
         configured, model = _PROVIDERS[name]
         if configured:
             return name, model
-    raise LLMError("No LLM configured.")
+    raise LLMError("No LLM configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY "
+                   "or OLLAMA_API_KEY / OLLAMA_BASE_URL.")
+
+
+def _provider_for_model(model: str) -> Optional[str]:
+    """Guess which configured provider serves a bare model id."""
+    m = model.lower()
+    if m.startswith("claude"):
+        return "anthropic"
+    if m.startswith(("gpt-", "gpt4", "o1", "o3", "o4", "chatgpt", "text-davinci")):
+        return "openai"
+    return None
+
+
+def resolve_model(requested: Optional[str]) -> tuple[str, str]:
+    """Resolve a caller-supplied model into (provider, model).
+
+    Accepts "provider:model" (e.g. "openai:gpt-4o"), a bare provider name
+    ("anthropic"), or a bare model id ("claude-sonnet-4-20250514").
+    Falls back to the environment default when nothing is requested.
+    """
+    requested = (requested or "").strip()
+    if not requested:
+        return pick_provider()
+    if not ALLOW_MODEL_OVERRIDE:
+        return pick_provider()
+
+    provider, model = None, requested
+    if ":" in requested:
+        head, tail = requested.split(":", 1)
+        if head.strip().lower() in _PROVIDERS:
+            provider, model = head.strip().lower(), tail.strip()
+    elif requested.lower() in _PROVIDERS:
+        provider, model = requested.lower(), ""
+
+    if provider is None:
+        provider = _provider_for_model(model)
+    if provider is None:
+        # Unknown prefix: assume a self-hosted / Ollama model when that is set up.
+        provider = "ollama" if _PROVIDERS["ollama"][0] else pick_provider()[0]
+
+    configured, default_model = _PROVIDERS[provider]
+    if not configured:
+        raise LLMError(f"provider {provider!r} has no credentials set")
+    return provider, (model or default_model)
+
+
+_model_cache: dict[str, tuple[float, list[str]]] = {}
+
+
+async def _list_provider_models(provider: str) -> list[str]:
+    """Live model ids for one configured provider, cached for MODEL_LIST_TTL."""
+    hit = _model_cache.get(provider)
+    if hit and time.time() - hit[0] < MODEL_LIST_TTL:
+        return hit[1]
+
+    models: list[str] = []
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            if provider == "anthropic":
+                r = await c.get(f"{ANTHROPIC_BASE_URL}/models?limit=100",
+                                headers={"x-api-key": ANTHROPIC_API_KEY,
+                                         "anthropic-version": ANTHROPIC_VERSION})
+                r.raise_for_status()
+                models = [m["id"] for m in r.json().get("data", []) if m.get("id")]
+            elif provider == "openai":
+                r = await c.get(f"{OPENAI_BASE_URL}/models",
+                                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"})
+                r.raise_for_status()
+                models = [m["id"] for m in r.json().get("data", []) if m.get("id")]
+                models = [m for m in models
+                          if m.startswith(("gpt-", "o1", "o3", "o4", "chatgpt"))]
+            elif provider == "ollama":
+                base = OLLAMA_BASE_URL or "https://ollama.com/v1"
+                headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
+                r = await c.get(f"{base}/models", headers=headers)
+                if r.status_code == 404 and base.endswith("/v1"):
+                    r = await c.get(f"{base[:-3].rstrip('/')}/api/tags", headers=headers)
+                    r.raise_for_status()
+                    models = [m["name"] for m in r.json().get("models", []) if m.get("name")]
+                else:
+                    r.raise_for_status()
+                    models = [m["id"] for m in r.json().get("data", []) if m.get("id")]
+    except Exception as e:                      # never let a listing failure break the UI
+        log.warning("model listing failed for %s: %s", provider, e)
+        default = _PROVIDERS[provider][1]
+        models = [default] if default else []
+
+    models = sorted(dict.fromkeys(models))
+    _model_cache[provider] = (time.time(), models)
+    return models
+
+
+async def list_all_models() -> dict[str, Any]:
+    """Every model available across every configured provider."""
+    names = configured_providers()
+    results = await asyncio.gather(*(_list_provider_models(n) for n in names),
+                                   return_exceptions=True)
+    out, flat = {}, []
+    for name, res in zip(names, results):
+        ids = res if isinstance(res, list) else []
+        out[name] = ids
+        flat += [f"{name}:{m}" for m in ids]
+    try:
+        default_provider, default_model = pick_provider()
+        default = f"{default_provider}:{default_model}"
+    except LLMError:
+        default = None
+    return {"providers": out, "models": flat, "default": default}
 
 
 def _parse_tool_args(raw: str, tool_name: str) -> dict:
@@ -1468,7 +1657,7 @@ async def _stream_openai(msgs: list[dict], tools_list: list[dict], model: str,
         if OLLAMA_API_KEY:
             headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
     else:
-        base = "https://api.openai.com/v1"
+        base = OPENAI_BASE_URL
         headers = {"Content-Type": "application/json"}
         if OPENAI_API_KEY:
             headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
@@ -1523,13 +1712,14 @@ async def _stream_anthropic(msgs: list[dict], tools_list: list[dict],
                             model: str) -> AsyncGenerator[dict, None]:
     """Stream an Anthropic completion, yielding text and tool calls."""
     system, out = _to_anthropic(msgs)
-    payload = {"model": model, "max_tokens": 4096, "messages": out, "stream": True}
+    payload = {"model": model, "max_tokens": ANTHROPIC_MAX_TOKENS,
+               "messages": out, "stream": True}
     if system:
         payload["system"] = system
     if tools_list:
         payload["tools"] = _anthropic_tools(tools_list)
     headers = {"x-api-key": ANTHROPIC_API_KEY,
-               "anthropic-version": "2023-06-01",
+               "anthropic-version": ANTHROPIC_VERSION,
                "Content-Type": "application/json"}
     blocks = {}
     async with httpx.AsyncClient(timeout=120) as c:
@@ -1572,9 +1762,10 @@ async def _stream_anthropic(msgs: list[dict], tools_list: list[dict],
         yield {"type": "tool_calls", "calls": calls}
 
 
-async def stream_chat(msgs: list[dict], tools_list: list[dict]) -> AsyncGenerator[dict, None]:
-    """Stream a completion from whichever provider is configured."""
-    provider, model = pick_provider()
+async def stream_chat(msgs: list[dict], tools_list: list[dict],
+                      requested_model: Optional[str] = None) -> AsyncGenerator[dict, None]:
+    """Stream a completion from the requested model, or the configured default."""
+    provider, model = resolve_model(requested_model)
     gen = (_stream_anthropic(msgs, tools_list, model) if provider == "anthropic"
            else _stream_openai(msgs, tools_list, model, provider))
     async for ev in gen:
@@ -1903,8 +2094,8 @@ async def _generate_pdf(filename: Optional[str], title: str, sections: Optional[
         flow.append(Spacer(1, 12))
     doc.build(flow)
     data = buf.getvalue()
-    fname = _safe_name(filename or "document.pdf", "pdf")
     stored = await store_media(data, "pdf", "application/pdf", fname)
+    fname = _safe_name(filename or "document.pdf", "pdf")
     return {"filename": fname, "size": len(data),
             "download_url": f"/api/media/{stored}?name={quote(fname)}"}
 
@@ -1937,8 +2128,8 @@ async def _generate_xlsx(filename: Optional[str], sheets: Optional[list],
     buf = io.BytesIO()
     wb.save(buf)
     data = buf.getvalue()
-    fname = _safe_name(filename or "workbook.xlsx", "xlsx")
     stored = await store_media(data, "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", fname)
+    fname = _safe_name(filename or "workbook.xlsx", "xlsx")
     return {"filename": fname, "size": len(data),
             "download_url": f"/api/media/{stored}?name={quote(fname)}"}
 
@@ -1964,8 +2155,8 @@ async def _generate_docx(filename: Optional[str], title: str,
     buf = io.BytesIO()
     doc.save(buf)
     data = buf.getvalue()
-    fname = _safe_name(filename or "document.docx", "docx")
     stored = await store_media(data, "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", fname)
+    fname = _safe_name(filename or "document.docx", "docx")
     return {"filename": fname, "size": len(data),
             "download_url": f"/api/media/{stored}?name={quote(fname)}"}
 
@@ -2019,18 +2210,11 @@ _DUCK_READERS = {"csv": "read_csv_auto", "parquet": "read_parquet",
                  "pq": "read_parquet", "json": "read_json_auto"}
 
 
-async def _resolve_source(source: str, user_id: str) -> Optional[Path]:
-    """Resolve a caller-supplied object, scoped to files the caller owns."""
+def _resolve_source(source: str) -> Optional[Path]:
+    """Materialize a caller-supplied object through the media abstraction."""
     if not source or len(source) > 260:
         return None
-    try:
-        key = media_store._safe_key(source)
-    except ValueError:
-        return None
-    meta = await db.get_media(key, user_id)
-    if not meta:
-        return None
-    return media_store.path(key)
+    return media_store.path(source)
 
 
 def _duck_load(con: Any, path: Path) -> None:
@@ -2054,14 +2238,14 @@ def _duck_lockdown(con: Any) -> None:
             log.warning("duckdb lockdown statement rejected: %s", stmt)
 
 
-async def _analyze_data(source: str, user_id: str, **_: Any) -> dict[str, Any]:
-    """Profile a caller-owned CSV/Parquet/JSON file, or raw CSV text."""
+async def _analyze_data(source: str, **_: Any) -> dict[str, Any]:
+    """Profile a stored CSV/Parquet/JSON file, or raw CSV text."""
     try:
         import duckdb
         import pandas as pd  # noqa: F401
     except ImportError:
         return {"error": "duckdb or pandas not installed"}
-    path = await _resolve_source(source, user_id) if "." in (source or "") else None
+    path = _resolve_source(source) if "." in (source or "") else None
     tmp_dir = None
     try:
         con = duckdb.connect()
@@ -2091,15 +2275,15 @@ async def _analyze_data(source: str, user_id: str, **_: Any) -> dict[str, Any]:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-async def _query_data(source: str, sql: str, user_id: str, **_: Any) -> dict[str, Any]:
-    """Run caller SQL over a caller-owned stored file with DuckDB, filesystem access off."""
+async def _query_data(source: str, sql: str, **_: Any) -> dict[str, Any]:
+    """Run caller SQL over a stored file with DuckDB, filesystem access off."""
     try:
         import duckdb
     except ImportError:
         return {"error": "duckdb not installed"}
-    path = await _resolve_source(source, user_id)
+    path = _resolve_source(source)
     if not path:
-        return {"error": "no data source provided, or it does not belong to you"}
+        return {"error": "no data source provided"}
     try:
         con = duckdb.connect()
         _duck_load(con, path)
@@ -2282,14 +2466,14 @@ class ToolRegistry:
           {"type": "object",
            "properties": {"source": {"type": "string"}},
            "required": ["source"]},
-          _analyze_data, is_async=True, needs_user=True)
+          _analyze_data, is_async=True)
         R("query_data",
           "Run SQL over an uploaded CSV/Parquet/JSON file using DuckDB.",
           {"type": "object",
            "properties": {"source": {"type": "string"},
                           "sql": {"type": "string"}},
            "required": ["source", "sql"]},
-          _query_data, is_async=True, needs_user=True)
+          _query_data, is_async=True)
 
     async def _run_code(self, user_id: str, language: str, code: str,
                         stdin: Optional[str] = "") -> dict[str, Any]:
@@ -2473,7 +2657,7 @@ header{height:54px;display:flex;align-items:center;gap:10px;padding:0 16px;borde
 <div class="convs" id="cl"><h2>Recent</h2></div>
 <div class="sf"><span class="dot" id="sd"></span><span id="st">connecting…</span>
 <button class="ib" id="lo" title="Sign out" style="margin-left:auto;width:26px;height:26px;font-size:12px">⏻</button></div></aside>
-<main><header><button class="ib" id="ts">☰</button><div class="title" id="ct">New chat</div><div class="mp" id="mp">—</div></header>
+<main><header><button class="ib" id="ts">☰</button><div class="title" id="ct">New chat</div><select class="mp" id="ms" title="Model" style="background:var(--panel);color:var(--muted);border:1px solid var(--line);border-radius:8px;padding:4px 8px;max-width:230px;font-size:12px"><option value="">auto</option></select></header>
 <div class="scroll" id="sc"><div class="thr" id="th"></div></div>
 <div class="cw"><div class="cp">
 <div id="attBar"></div>
@@ -2508,9 +2692,19 @@ const esc=s=>String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'
 function toast(m,e){const t=$('#tst');t.textContent=m;t.className='toast show'+(e?' err':'');clearTimeout(toast._);toast._=setTimeout(()=>t.className='toast',3400)}
 async function jf(path,opts){const r=await fetch(API+path,{credentials:'include',headers:H,...opts});if(r.status===401){authShow();throw new Error('sign in required')}return r}
 async function health(){try{const d=await(await fetch(API+'/api/health',{credentials:'include'})).json();
-if(d.ok){$('#sd').style.background='var(--acc2)';$('#st').textContent='online';$('#mp').textContent=(d.provider||'unknown')+' · '+(d.model||'unknown');$('#ht').textContent=(d.tools?d.tools.length+' tools · ':'')+(d.sandbox||'')}
-else{$('#sd').style.background='#ffb020';$('#st').textContent='no model';$('#mp').textContent='—';$('#ht').textContent=d.error||''}}
+if(d.ok&&d.provider){$('#sd').style.background='var(--acc2)';$('#st').textContent='online';$('#ht').textContent=(d.providers||[]).join(' · ')+(d.sandbox?' · '+d.sandbox:'')}
+else{$('#sd').style.background='#ffb020';$('#st').textContent='no model';$('#ht').textContent=d.warning||d.error||''}}
 catch{$('#sd').style.background='#ff6b81';$('#st').textContent='offline'}}
+async function loadModels(){const s=$('#ms');if(!s)return;
+try{const d=await(await jf('/api/models')).json();
+const saved=localStorage.getItem('yiz_model')||'';
+s.innerHTML='<option value="">auto'+(d.default?' ('+d.default+')':'')+'</option>';
+for(const [prov,list] of Object.entries(d.providers||{})){
+const g=document.createElement('optgroup');g.label=prov;
+for(const m of list){const o=document.createElement('option');o.value=prov+':'+m;o.textContent=m;g.appendChild(o)}
+s.appendChild(g)}
+if(saved&&[...s.options].some(o=>o.value===saved))s.value=saved;
+s.onchange=()=>localStorage.setItem('yiz_model',s.value)}catch(e){}}
 const mk=(t,c,h)=>{const n=document.createElement(t);if(c)n.className=c;if(h!=null)n.innerHTML=h;return n};
 async function loadConvs(){const L=$('#cl');try{const d=await(await jf('/api/conversations')).json();
 L.querySelectorAll('.conv,h2:not(:first-child)').forEach(n=>n.remove());
@@ -2579,10 +2773,11 @@ const w=document.querySelector('.wel');if(w)w.remove();
 addMsg('user',p);ip.value='';grow();dwn();
 streaming=true;$('#send').disabled=true;
 const{bd:b}=addMsg('assistant','');b.innerHTML='<span class="cur"></span>';
-let txt='';const tbs=new Map();let streamError=false;
+let txt='';const tbs=new Map();
 try{
 const endpoint=uploadedFiles.length?'/api/chat-with-files':'/api/chat';
 const payload={prompt:p,conversation_id:cid};
+const _m=($('#ms')&&$('#ms').value)||'';if(_m)payload.model=_m;
 if(uploadedFiles.length)payload.attachment_ids=uploadedFiles.map(f=>f.id);
 const r=await fetch(API+endpoint,{method:'POST',credentials:'include',headers:H,body:JSON.stringify(payload)});
 if(r.status===401){authShow();throw new Error('sign in required')}
@@ -2597,12 +2792,11 @@ if(ev==='token'){txt+=pl.delta;b.innerHTML=rmd(txt)+'<span class="cur"></span>';
 else if(ev==='tool_start'){const x=addTool(pl.name,pl.args);x._args=pl.args;tbs.set(pl.id,x);dwn()}
 else if(ev==='tool_end'){const x=tbs.get(pl.id);if(x)finishTool(x,pl.result);dwn()}
 else if(ev==='media'){appendMedia(b,pl)}
-else if(ev==='error'){streamError=true;b.innerHTML='<span style="color:#ffb3bd">⚠️ '+esc(pl.message)+'</span>'}
+else if(ev==='error'){b.innerHTML='<span style="color:#ffb3bd">⚠️ '+esc(pl.message)+'</span>'}
 else if(ev==='done'){if(pl.conversation_id&&pl.conversation_id!==cid){cid=pl.conversation_id;markA();loadConvs()}
 $('#ct').textContent=p.slice(0,60)}}}
-if(!streamError){b.innerHTML=rmd(txt||'*(no response)*');hl(b)}
-dwn();loadConvs();markA();
-}catch(e){streamError=true;b.innerHTML='<span style="color:#ffb3bd">⚠️ '+esc(e.message||'Network error — check your connection.')+'</span>';toast(e.message||'Network error',1)}
+b.innerHTML=rmd(txt||'*(no response)*');hl(b);dwn();loadConvs();markA();
+}catch(e){b.innerHTML='<span style="color:#ffb3bd">⚠️ '+esc(e.message)+'</span>';toast(e.message,1)}
 finally{streaming=false;$('#send').disabled=false;$('#ip').focus()}}
 async function openConv(id,title){cid=id;$('#ct').textContent=title||'Chat';markA();clearTh();
 try{const d=await(await jf('/api/conversations/'+id)).json();
@@ -2648,7 +2842,7 @@ if(!d.providers.length)box.style.display='none'}catch{}}
 async function boot(){try{const r=await fetch(API+'/api/auth/me',{credentials:'include',headers:H});
 if(!r.ok){authShow();return}
 const me=await r.json();$('#st').textContent=me.email||'signed in';authHide();
-await loadConvs();welcome();health()}
+await loadConvs();welcome();health();loadModels()}
 catch{authShow()}}
 setMode('login');loadProviders();boot();
 grow();$('#ip').focus();
@@ -2687,7 +2881,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     plugin_loader.load_all()
     for p in plugin_loader.loaded:
         tools.register(p["name"], p["description"], p["parameters"],
-                       p["run"], is_async=True)
+                       p["run"],
+                       is_async=inspect.iscoroutinefunction(p["run"]))
     retention_task = asyncio.create_task(retention_worker())
     yield
     retention_task.cancel()
@@ -2741,6 +2936,7 @@ class ChatRequest(BaseModel):
     """Payload for a plain chat turn."""
     prompt: str = Field(min_length=1, max_length=20000)
     conversation_id: Optional[str] = None
+    model: Optional[str] = Field(default=None, max_length=200)
 
 
 class ChatWithFilesRequest(BaseModel):
@@ -2748,6 +2944,7 @@ class ChatWithFilesRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=20000)
     conversation_id: Optional[str] = None
     attachment_ids: list[str] = Field(default_factory=list, max_length=5)
+    model: Optional[str] = Field(default=None, max_length=200)
 
 
 async def _optional_user(request: Request) -> Optional[dict]:
@@ -2766,13 +2963,26 @@ async def _optional_user(request: Request) -> Optional[dict]:
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    """Fast liveness endpoint; reports the active LLM provider when one is configured."""
+    """Liveness endpoint: always HTTP 200 while the web process is up."""
+    info: dict[str, Any] = {"ok": True, "service": "yiz-ai", "version": "5.0.0",
+                            "sandbox": SANDBOX_PROVIDER,
+                            "providers": configured_providers(),
+                            "mcp_servers": mcp_client.list_servers()}
     try:
         provider, model = pick_provider()
-    except LLMError as e:
-        return {"ok": False, "service": "yiz-ai", "version": "5.0.0", "error": str(e)}
-    return {"ok": True, "service": "yiz-ai", "version": "5.0.0",
-            "provider": provider, "model": model, "sandbox": SANDBOX_PROVIDER}
+        info["provider"], info["model"] = provider, model
+    except LLMError as exc:
+        info["provider"], info["model"] = None, None
+        info["warning"] = str(exc)
+    return info
+
+
+@app.get("/api/models")
+async def models(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Every model reachable with the configured provider credentials."""
+    await rate_limiter.hit(f"models:{user['id']}", RL_API_PER_MIN, 60)
+    return await list_all_models()
+
 
 @app.get("/api/ready")
 async def ready() -> Response:
@@ -3055,33 +3265,49 @@ def _trim_history(history: list[dict]) -> list[dict]:
     return window
 
 
+HEAVY_WORKER_TOOLS = {
+    "generate_image", "generate_video", "text_to_speech",
+    "generate_text_file", "generate_csv", "generate_json_file", "generate_markdown_file",
+    "generate_pdf", "generate_xlsx", "generate_docx", "make_chart", "generate_qr",
+}
+
+
 async def dispatch_tool(name: str, args: dict[str, Any], user_id: str) -> str:
-    """Run a tool call locally. (A Redis-backed worker queue for heavy media
-    tools can be added later; there is no job_queue module in this deployment.)"""
+    """Run heavy media work in Redis worker when available, otherwise locally."""
+    if name in HEAVY_WORKER_TOOLS and REDIS_URL:
+        try:
+            from job_queue import enqueue_and_wait, worker_available
+        except ImportError:
+            log.debug("job_queue module not deployed; running %s in-process", name)
+        else:
+            try:
+                if await worker_available():
+                    result = await enqueue_and_wait(name, args, user_id=user_id)
+                    return json.dumps(result, default=str)
+                log.warning("no fresh worker heartbeat; executing %s locally", name)
+            except Exception as e:
+                log.warning("worker dispatch failed for %s (%s); running locally", name, e)
     return await tools.call(name, args, user_id=user_id)
 
 
-async def agent_stream(prompt: str, cid: str,
-                       user_id: str) -> AsyncGenerator[str, None]:
+async def agent_stream(prompt: str, cid: str, user_id: str,
+                       model: Optional[str] = None) -> AsyncGenerator[str, None]:
     """Run the tool-calling loop for one turn, emitting SSE frames."""
     await db.add_message(cid, "user", prompt)
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     msgs += _trim_history(await db.get_messages(cid))
 
     schemas = tools.schemas()
-    try:
-        for m in await mcp_client.all_tools():
-            schemas.append({"name": m["name"],
-                            "description": f"[MCP:{m['server']}] {m['description']}",
-                            "parameters": m["input_schema"]})
-    except Exception as e:
-        log.warning("MCP tool discovery failed; continuing without MCP tools: %s", e)
+    for m in await mcp_client.all_tools():
+        schemas.append({"name": m["name"],
+                        "description": f"[MCP:{m['server']}] {m['description']}",
+                        "parameters": m["input_schema"]})
 
     final_text = ""
     for _ in range(MAX_STEPS):
         parts, calls = [], []
         try:
-            async for ev in stream_chat(msgs, schemas):
+            async for ev in stream_chat(msgs, schemas, model):
                 if ev["type"] == "text":
                     parts.append(ev["delta"])
                     yield sse("token", {"delta": ev["delta"]})
@@ -3091,9 +3317,7 @@ async def agent_stream(prompt: str, cid: str,
             yield sse("error", {"message": str(e)})
             return
         except Exception as e:
-            rid = uuid.uuid4().hex[:8]
-            log.exception("agent_stream:%s unhandled error", rid)
-            yield sse("error", {"message": f"Something went wrong (ref {rid})."})
+            yield sse("error", {"message": f"{type(e).__name__}: {e}"})
             return
 
         text = "".join(parts)
@@ -3176,7 +3400,7 @@ async def chat(body: ChatRequest, user: dict = Depends(get_current_user)) -> Str
         if not await db.get_messages(cid):
             await db.rename_conversation(cid, user["id"], body.prompt[:60])
     return StreamingResponse(
-        with_heartbeat(agent_stream(body.prompt, cid, user["id"])),
+        with_heartbeat(agent_stream(body.prompt, cid, user["id"], body.model)),
         media_type="text/event-stream", headers=_stream_headers())
 
 
@@ -3217,7 +3441,7 @@ async def chat_with_files(body: ChatWithFilesRequest,
             await db.rename_conversation(cid, user["id"], body.prompt[:60])
 
     return StreamingResponse(
-        with_heartbeat(agent_stream(full_prompt, cid, user["id"])),
+        with_heartbeat(agent_stream(full_prompt, cid, user["id"], body.model)),
         media_type="text/event-stream", headers=_stream_headers())
 
 
