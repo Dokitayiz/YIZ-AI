@@ -96,6 +96,10 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()
 # Allow callers to pick any model the configured providers expose.
 ALLOW_MODEL_OVERRIDE = os.getenv("ALLOW_MODEL_OVERRIDE", "true").lower() in ("1", "true", "yes")
+# When an override is used, require the model to appear in that provider's live
+# /api/models listing. Fails open (allows the request) if the listing call itself
+# fails, so a flaky provider API can't block chat entirely.
+MODEL_OVERRIDE_STRICT = os.getenv("MODEL_OVERRIDE_STRICT", "true").lower() in ("1", "true", "yes")
 MODEL_LIST_TTL = int(os.getenv("MODEL_LIST_TTL", 300))
 ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1").rstrip("/")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
@@ -1567,6 +1571,21 @@ async def _list_provider_models(provider: str) -> list[str]:
     return models
 
 
+async def _validate_model_override(provider: str, model: str) -> None:
+    """Reject a caller-chosen model that isn't in that provider's live catalog.
+
+    Fails open when the catalog call itself failed (empty list), so a flaky
+    provider listing endpoint degrades to "unchecked", not "broken".
+    """
+    if not MODEL_OVERRIDE_STRICT:
+        return
+    available = await _list_provider_models(provider)
+    if available and model not in available:
+        raise LLMError(
+            f"{model!r} is not in {provider}'s current model list. "
+            "Choose one from /api/models.")
+
+
 async def list_all_models() -> dict[str, Any]:
     """Every model available across every configured provider."""
     names = configured_providers()
@@ -1801,6 +1820,8 @@ async def stream_chat(msgs: list[dict], tools_list: list[dict],
                       requested_model: Optional[str] = None) -> AsyncGenerator[dict, None]:
     """Stream a completion from the requested model, or the configured default."""
     provider, model = resolve_model(requested_model)
+    if requested_model:
+        await _validate_model_override(provider, model)
     gen = (_stream_anthropic(msgs, tools_list, model) if provider == "anthropic"
            else _stream_openai(msgs, tools_list, model, provider))
     async for ev in gen:
@@ -2117,6 +2138,8 @@ async def _generate_pdf(filename: Optional[str], title: str, sections: Optional[
     body_style = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=11, leading=16)
     flow = [Paragraph(title or "Document", styles["Title"]), Spacer(1, 20)]
     for sec in sections or []:
+        if not isinstance(sec, dict):
+            sec = {"body": sec}
         h = sec.get("heading")
         b = sec.get("body", "")
         if h:
@@ -2146,7 +2169,9 @@ async def _generate_xlsx(filename: Optional[str], sheets: Optional[list],
     wb = Workbook()
     wb.remove(wb.active)
     for s in sheets or []:
-        name = (s.get("name") or "Sheet")[:31]
+        if not isinstance(s, dict):
+            continue
+        name = str(s.get("name") or "Sheet")[:31]
         ws = wb.create_sheet(title=name)
         headers = s.get("headers") or []
         if headers:
@@ -2739,7 +2764,10 @@ const s=$('#ms');if(s&&s.options.length)s.options[0].textContent='auto ('+d.prov
 else{$('#sd').style.background='#ffb020';$('#st').textContent='no model';$('#ht').textContent=d.warning||d.error||''}}
 catch{$('#sd').style.background='#ff6b81';$('#st').textContent='offline'}}
 async function loadModels(){const s=$('#ms');if(!s)return;
-try{const d=await(await jf('/api/models')).json();
+try{
+const r=await jf('/api/models');
+if(!r.ok)throw new Error('model listing failed: HTTP '+r.status);
+const d=await r.json();
 const saved=localStorage.getItem('yiz_model')||'';
 s.innerHTML='<option value="">auto'+(d.default?' ('+d.default+')':'')+'</option>';
 for(const [prov,list] of Object.entries(d.providers||{})){
@@ -2747,7 +2775,8 @@ const g=document.createElement('optgroup');g.label=prov;
 for(const m of list){const o=document.createElement('option');o.value=prov+':'+m;o.textContent=m;g.appendChild(o)}
 s.appendChild(g)}
 if(saved&&[...s.options].some(o=>o.value===saved))s.value=saved;
-s.onchange=()=>localStorage.setItem('yiz_model',s.value)}catch(e){}}
+s.onchange=()=>localStorage.setItem('yiz_model',s.value)
+}catch(e){console.warn('Model listing failed:',e);s.innerHTML='<option value="">auto</option>'}}
 const mk=(t,c,h)=>{const n=document.createElement(t);if(c)n.className=c;if(h!=null)n.innerHTML=h;return n};
 async function loadConvs(){const L=$('#cl');try{const d=await(await jf('/api/conversations')).json();
 L.querySelectorAll('.conv,h2:not(:first-child)').forEach(n=>n.remove());
@@ -3043,6 +3072,12 @@ async def health() -> dict[str, Any]:
         info["provider"], info["model"] = None, None
         info["warning"] = str(exc)
     return info
+
+
+@app.get("/healthz")
+async def healthz() -> dict[str, Any]:
+    """Alias of /api/health for platforms that default to /healthz."""
+    return await health()
 
 
 @app.get("/api/models")
