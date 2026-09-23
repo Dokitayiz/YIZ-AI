@@ -1960,7 +1960,18 @@ async def stream_chat(msgs: list[dict], tools_list: list[dict],
         await _validate_model_override(provider, model)
         candidates = [(provider, model)]
     else:
-        candidates = [(n, _PROVIDERS[n][1]) for n in _PROVIDER_ORDER if _PROVIDERS[n][0]]
+        # Respect an operator-pinned primary provider (LLM_PROVIDER), but
+        # unlike the old strict pick_provider() behaviour, a pinned provider
+        # that's down or misconfigured no longer hard-fails the request —
+        # it's just tried first, then the rest of _PROVIDER_ORDER acts as
+        # its fallback chain. (e.g. LLM_PROVIDER=kimi makes Kimi primary,
+        # falling through to DeepSeek/others only if Kimi's call fails.)
+        order = list(_PROVIDER_ORDER)
+        if LLM_PROVIDER:
+            if LLM_PROVIDER not in _PROVIDERS:
+                raise LLMError(f"LLM_PROVIDER={LLM_PROVIDER!r} is not a known provider.")
+            order = [LLM_PROVIDER] + [p for p in _PROVIDER_ORDER if p != LLM_PROVIDER]
+        candidates = [(n, _PROVIDERS[n][1]) for n in order if _PROVIDERS[n][0]]
         if not candidates:
             raise LLMError("No LLM configured. Set an API key for at least one provider.")
 
@@ -3127,6 +3138,16 @@ header{height:54px;display:flex;align-items:center;gap:10px;padding:0 16px;borde
 .oauth a:hover{border-color:rgba(124,108,255,.5)}
 .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(80px);background:#1a1a2e;border:1px solid var(--line);padding:10px 18px;border-radius:11px;font-size:13px;z-index:60;transition:transform .28s cubic-bezier(.34,1.4,.64,1);max-width:90vw}
 .toast.show{transform:translateX(-50%) translateY(0)}.toast.err{border-color:rgba(255,107,129,.5);color:#ffb3bd}
+.md.wide{max-width:560px;max-height:80vh;overflow-y:auto}
+.mcpsrv{border:1px solid var(--line);border-radius:11px;padding:12px 14px;margin-bottom:10px}
+.mcpsrv h4{margin:0 0 4px;font-size:13.5px;display:flex;align-items:center;gap:8px}
+.mcpsrv .badge{font-size:10.5px;padding:2px 7px;border-radius:20px;font-weight:600}
+.mcpsrv .badge.ok{background:rgba(66,214,146,.15);color:#42d692}
+.mcpsrv .badge.bad{background:rgba(255,107,129,.15);color:#ff6b81}
+.mcpsrv .url{font-size:11.5px;color:var(--muted);word-break:break-all;margin:0 0 8px}
+.mcptool{font-size:12px;color:#c9c9dd;padding:3px 0;border-top:1px solid rgba(255,255,255,.05)}
+.mcptool b{color:var(--txt);font-weight:600}
+.mcpempty{color:var(--muted);font-size:13px;text-align:center;padding:30px 10px}
 ::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:rgba(124,108,255,.2);border-radius:4px}
 @media(max-width:820px){aside{position:fixed;z-index:40;height:100%;box-shadow:24px 0 60px rgba(0,0,0,.6)}.thr,.cp,.hint{padding-inline:14px}.cards{grid-template-columns:1fr}}
 </style></head><body>
@@ -3134,7 +3155,8 @@ header{height:54px;display:flex;align-items:center;gap:10px;padding:0 16px;borde
 <button class="nc" id="nc"><span>+</span> New chat</button>
 <div class="convs" id="cl"><h2>Recent</h2></div>
 <div class="sf"><span class="dot" id="sd"></span><span id="st">connecting…</span>
-<button class="ib" id="lo" title="Sign out" style="margin-left:auto;width:26px;height:26px;font-size:12px">⏻</button></div></aside>
+<button class="ib" id="toolsBtn" title="Tools & MCP" style="width:26px;height:26px;font-size:13px;margin-left:auto">🔌</button>
+<button class="ib" id="lo" title="Sign out" style="width:26px;height:26px;font-size:12px">⏻</button></div></aside>
 <main><header><button class="ib" id="ts">☰</button><div class="title" id="ct">New chat</div><select class="mp" id="ms" title="Model" style="background:var(--panel);color:var(--muted);border:1px solid var(--line);border-radius:8px;padding:4px 8px;max-width:230px;font-size:12px"><option value="">auto</option></select></header>
 <div class="scroll" id="sc"><div class="thr" id="th"></div></div>
 <div class="cw"><div class="cp">
@@ -3145,6 +3167,12 @@ header{height:54px;display:flex;align-items:center;gap:10px;padding:0 16px;borde
 <input type="file" id="fileInput" style="display:none" multiple>
 </div>
 <div class="hint"><span id="ht">Tools available</span><span id="hn"></span></div></div></main>
+<div class="ov" id="to"><div class="md wide">
+<h3 style="margin:0 0 4px">Tools &amp; MCP</h3><p class="sub" style="margin:0 0 16px">Built-in tools plus any connected Model Context Protocol servers.</p>
+<div id="toBody"><p class="mcpempty">Loading…</p></div>
+<div class="mact"><button class="bt" id="toClose" type="button">Close</button></div>
+</div></div>
+
 <div class="ov" id="ao"><div class="md">
 <h3 id="at">Sign in to Yiz AI</h3><p class="sub" id="as">Your chats are private to your account.</p>
 <div class="fl"><label>Email</label><input id="ae" type="email" autocomplete="email" placeholder="you@example.com"></div>
@@ -3171,7 +3199,7 @@ function toast(m,e){const t=$('#tst');t.textContent=m;t.className='toast show'+(
 async function jf(path,opts){const r=await fetch(API+path,{credentials:'include',headers:H,...opts});if(r.status===401){authShow();throw new Error('sign in required')}return r}
 async function health(){try{const d=await(await fetch(API+'/api/health',{credentials:'include'})).json();
 if(d.ok&&d.provider){$('#sd').style.background='var(--acc2)';$('#st').textContent='online';
-$('#ht').textContent=d.provider+' · '+(d.model||'unknown')+(d.sandbox?' · '+d.sandbox:'')+((d.providers||[]).length>1?' · '+d.providers.length+' providers':'');
+$('#ht').textContent=d.provider+' · '+(d.model||'unknown')+(d.sandbox?' · '+d.sandbox:'')+((d.providers||[]).length>1?' · '+d.providers.length+' providers':'')+((d.mcp_servers||[]).length?' · '+d.mcp_servers.length+' MCP':'');
 const s=$('#ms');if(s&&s.options.length)s.options[0].textContent='auto ('+d.provider+':'+(d.model||'?')+')'}
 else{$('#sd').style.background='#ffb020';$('#st').textContent='no model';$('#ht').textContent=d.warning||d.error||''}}
 catch{$('#sd').style.background='#ff6b81';$('#st').textContent='offline'}}
@@ -3189,6 +3217,24 @@ s.appendChild(g)}
 if(saved&&[...s.options].some(o=>o.value===saved))s.value=saved;
 s.onchange=()=>localStorage.setItem('yiz_model',s.value)
 }catch(e){console.warn('Model listing failed:',e);s.innerHTML='<option value="">auto</option>'}}
+async function loadMcpStatus(){const body=$('#toBody');body.innerHTML='<p class="mcpempty">Loading…</p>';
+try{
+const r=await jf('/api/mcp/status');
+if(!r.ok)throw new Error('HTTP '+r.status);
+const d=await r.json();
+let html='<p style="font-size:12.5px;color:var(--muted);margin:0 0 14px">'+d.builtin_tool_count+' built-in tools always available.</p>';
+if(!d.servers.length&&!d.rejected.length){
+html+='<p class="mcpempty">No MCP servers configured.<br>Set <code>MCP_SERVERS=name=https://host</code> in your environment to connect one.</p>'}
+else{
+for(const s of d.servers){
+html+='<div class="mcpsrv"><h4>'+esc(s.name)+' <span class="badge '+(s.status==='ok'?'ok':'bad')+'">'+(s.status==='ok'?s.tools.length+' tools':'unreachable')+'</span></h4>'+
+'<p class="url">'+esc(s.url)+'</p>'+
+s.tools.map(t=>'<div class="mcptool"><b>'+esc(t.name)+'</b>'+(t.description?' — '+esc(t.description):'')+'</div>').join('')+
+'</div>'}
+for(const s of d.rejected){
+html+='<div class="mcpsrv"><h4>'+esc(s.name)+' <span class="badge bad">rejected</span></h4><p class="url">'+esc(s.url)+'</p><p style="font-size:12px;color:#ff6b81;margin:0">'+esc(s.reason)+'</p></div>'}}
+body.innerHTML=html
+}catch(e){body.innerHTML='<p class="mcpempty">Could not load MCP status: '+esc(e.message)+'</p>'}}
 const mk=(t,c,h)=>{const n=document.createElement(t);if(c)n.className=c;if(h!=null)n.innerHTML=h;return n};
 async function loadConvs(){const L=$('#cl');try{const d=await(await jf('/api/conversations')).json();
 L.querySelectorAll('.conv,h2:not(:first-child)').forEach(n=>n.remove());
@@ -3300,6 +3346,9 @@ function grow(){const t=$('#ip');t.style.height='auto';t.style.height=Math.min(t
 $('#ip').addEventListener('input',grow);
 $('#ip').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});
 $('#send').onclick=send;$('#nc').onclick=newChat;$('#ts').onclick=()=>$('#sb').classList.toggle('hide');
+$('#toolsBtn').onclick=()=>{$('#to').style.display='grid';loadMcpStatus()};
+$('#toClose').onclick=()=>{$('#to').style.display='none'};
+$('#to').onclick=e=>{if(e.target.id==='to')$('#to').style.display='none'};
 $('#lo').onclick=async()=>{try{await fetch(API+'/api/auth/logout',{method:'POST',credentials:'include',headers:H})}catch{}cid=null;authShow()};
 let amode='login';
 function authShow(){$('#ao').classList.add('show')}
@@ -3497,6 +3546,27 @@ async def models(user: dict = Depends(get_current_user)) -> dict[str, Any]:
     """Every model reachable with the configured provider credentials."""
     await rate_limiter.hit(f"models:{user['id']}", RL_API_PER_MIN, 60)
     return await list_all_models()
+
+
+@app.get("/api/mcp/status")
+async def mcp_status(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Configured MCP servers, their reachable tools, and any rejected entries.
+
+    Backs the sidebar's Tools & MCP panel — this is what makes MCP visible in
+    the UI instead of only existing as tools the model can silently call.
+    """
+    await rate_limiter.hit(f"mcpstatus:{user['id']}", RL_API_PER_MIN, 60)
+    servers = []
+    for name in mcp_client.list_servers():
+        mcp_tools = await mcp_client.list_tools(name)
+        servers.append({"name": name, "url": mcp_client.servers[name],
+                        "status": "ok" if mcp_tools else "unreachable",
+                        "tools": [{"name": t["name"], "description": t["description"]}
+                                 for t in mcp_tools]})
+    rejected = [{"name": n, "url": u, "reason": "rejected by URL validation "
+                "(see server logs)"} for n, u in mcp_client.rejected.items()]
+    return {"servers": servers, "rejected": rejected,
+            "builtin_tool_count": len(tools.schemas())}
 
 
 @app.get("/api/ready")
