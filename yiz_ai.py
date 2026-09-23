@@ -89,11 +89,20 @@ OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "").strip().rstrip("/")
 if not OLLAMA_BASE_URL and OLLAMA_API_KEY:
     OLLAMA_BASE_URL = "https://ollama.com/v1"
+# Kimi (Moonshot AI) and DeepSeek both speak the OpenAI chat-completions format,
+# so they reuse _stream_openai() with their own base URL and key.
+KIMI_API_KEY = os.getenv("KIMI_API_KEY", "").strip()
+KIMI_BASE_URL = os.getenv("KIMI_BASE_URL", "https://api.moonshot.ai/v1").rstrip("/")
+KIMI_MODEL = os.getenv("KIMI_MODEL", "kimi-k2-0711-preview")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
-# anthropic | openai | ollama | "" (auto: anthropic, then openai, then ollama)
+# anthropic | openai | kimi | deepseek | ollama | "" (auto: tries each configured
+# provider in _PROVIDER_ORDER until one has credentials)
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()
 # Allow callers to pick any model the configured providers expose.
 ALLOW_MODEL_OVERRIDE = os.getenv("ALLOW_MODEL_OVERRIDE", "false").lower() in ("1", "true", "yes")
@@ -104,8 +113,21 @@ MODEL_OVERRIDE_STRICT = os.getenv("MODEL_OVERRIDE_STRICT", "true").lower() in ("
 MODEL_LIST_TTL = int(os.getenv("MODEL_LIST_TTL", 300))
 ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1").rstrip("/")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+# Audio transcription (voice notes) speaks OpenAI's /audio/transcriptions API;
+# reuses OPENAI_API_KEY/OPENAI_BASE_URL. No effect without an OpenAI key.
+TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "whisper-1")
 ANTHROPIC_VERSION = os.getenv("ANTHROPIC_VERSION", "2023-06-01")
 ANTHROPIC_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", 4096))
+
+# Connection details for every OpenAI-compatible provider (all but anthropic).
+# _stream_openai() and _list_provider_models() both key off this so adding a
+# new OpenAI-compatible provider only ever needs an entry here plus _PROVIDERS.
+_OPENAI_COMPAT: dict[str, tuple[str, str]] = {
+    "openai": (OPENAI_BASE_URL, OPENAI_API_KEY),
+    "kimi": (KIMI_BASE_URL, KIMI_API_KEY),
+    "deepseek": (DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY),
+    "ollama": (OLLAMA_BASE_URL or "https://ollama.com/v1", OLLAMA_API_KEY),
+}
 
 SANDBOX_PROVIDER = os.getenv("SANDBOX_PROVIDER", "piston").lower()
 PISTON_URL = os.getenv("PISTON_URL", "https://emkc.org/api/v2/piston").rstrip("/")
@@ -1467,9 +1489,14 @@ class LLMError(Exception):
 _PROVIDERS: dict[str, tuple[bool, str]] = {
     "anthropic": (bool(ANTHROPIC_API_KEY), ANTHROPIC_MODEL),
     "openai": (bool(OPENAI_API_KEY), OPENAI_MODEL),
+    "kimi": (bool(KIMI_API_KEY), KIMI_MODEL),
+    "deepseek": (bool(DEEPSEEK_API_KEY), DEEPSEEK_MODEL),
     "ollama": (bool(OLLAMA_BASE_URL or OLLAMA_API_KEY), OLLAMA_MODEL),
 }
-_PROVIDER_ORDER = ("anthropic", "openai", "ollama")
+# Order "auto" tries providers in, and the order /api/models lists them in.
+# Kimi and DeepSeek sit ahead of Ollama, so a locally/cloud-hosted Ollama model
+# is only used when neither hosted provider has credentials configured.
+_PROVIDER_ORDER = ("anthropic", "openai", "kimi", "deepseek", "ollama")
 
 
 def configured_providers() -> list[str]:
@@ -1501,6 +1528,10 @@ def _provider_for_model(model: str) -> Optional[str]:
         return "anthropic"
     if m.startswith(("gpt-", "gpt4", "o1", "o3", "o4", "chatgpt", "text-davinci")):
         return "openai"
+    if m.startswith("kimi"):
+        return "kimi"
+    if m.startswith("deepseek"):
+        return "deepseek"
     return None
 
 
@@ -1568,6 +1599,12 @@ async def _list_provider_models(provider: str) -> list[str]:
                 models = [m["id"] for m in r.json().get("data", []) if m.get("id")]
                 models = [m for m in models
                           if m.startswith(("gpt-", "o1", "o3", "o4", "chatgpt"))]
+            elif provider in ("kimi", "deepseek"):
+                base, key = _OPENAI_COMPAT[provider]
+                r = await c.get(f"{base}/models",
+                                headers={"Authorization": f"Bearer {key}"})
+                r.raise_for_status()
+                models = [m["id"] for m in r.json().get("data", []) if m.get("id")]
             elif provider == "ollama":
                 base = OLLAMA_BASE_URL or "https://ollama.com/v1"
                 headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
@@ -1722,17 +1759,13 @@ def _anthropic_tools(schemas: list[dict]) -> list[dict]:
 
 async def _stream_openai(msgs: list[dict], tools_list: list[dict], model: str,
                          provider: str = "openai") -> AsyncGenerator[dict, None]:
-    """Stream an OpenAI-compatible completion (OpenAI or Ollama), text and tool calls."""
-    if provider == "ollama":
-        base = OLLAMA_BASE_URL or "https://ollama.com/v1"
-        headers = {"Content-Type": "application/json"}
-        if OLLAMA_API_KEY:
-            headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
-    else:
-        base = OPENAI_BASE_URL
-        headers = {"Content-Type": "application/json"}
-        if OPENAI_API_KEY:
-            headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+    """Stream an OpenAI-compatible completion (openai/kimi/deepseek/ollama)."""
+    if provider not in _OPENAI_COMPAT:
+        raise LLMError(f"{provider!r} is not an OpenAI-compatible provider")
+    base, key = _OPENAI_COMPAT[provider]
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     payload = {"model": model, "messages": _to_openai(msgs), "stream": True}
     if tools_list:
         payload["tools"] = [{"type": "function", "function": s} for s in tools_list]
@@ -2248,6 +2281,217 @@ async def _generate_docx(filename: Optional[str], title: str,
             "download_url": f"/api/media/{stored}?name={quote(fname)}"}
 
 
+async def _generate_pptx(filename: Optional[str], title: str,
+                         slides: Optional[list], **_: Any) -> dict[str, Any]:
+    """Render a PowerPoint deck. slides = [{heading, bullets: [str,...]} | {heading, body}]."""
+    try:
+        from pptx import Presentation
+        from pptx.util import Inches
+    except ImportError:
+        return {"error": "python-pptx not installed"}
+    prs = Presentation()
+    title_slide = prs.slides.add_slide(prs.slide_layouts[0])
+    title_slide.shapes.title.text = title or "Presentation"
+    for s in slides or []:
+        if not isinstance(s, dict):
+            s = {"heading": str(s)}
+        sl = prs.slides.add_slide(prs.slide_layouts[1])
+        sl.shapes.title.text = str(s.get("heading") or "")
+        bullets = s.get("bullets") or ([s["body"]] if s.get("body") else [])
+        try:
+            body = sl.placeholders[1].text_frame
+        except (KeyError, IndexError):
+            body = sl.shapes.add_textbox(Inches(0.5), Inches(1.5),
+                                         Inches(9), Inches(5)).text_frame
+        if bullets:
+            body.text = str(bullets[0])
+            for b in bullets[1:]:
+                body.add_paragraph().text = str(b)
+    buf = io.BytesIO()
+    prs.save(buf)
+    data = buf.getvalue()
+    fname = _safe_name(filename or "presentation.pptx", "pptx")
+    stored = await store_media(
+        data, "pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        fname)
+    return {"filename": fname, "size": len(data),
+            "download_url": f"/api/media/{stored}?name={quote(fname)}"}
+
+
+def _ocr_image_bytes(data: bytes) -> Optional[str]:
+    """Run Tesseract OCR over raw image bytes.
+
+    Returns None (never raises) when pytesseract/Pillow aren't installed,
+    the tesseract binary itself is missing from the host, or no text is
+    found — any of which should degrade gracefully, not break the caller.
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        img = Image.open(io.BytesIO(data))
+        return pytesseract.image_to_string(img).strip() or None
+    except pytesseract.pytesseract.TesseractNotFoundError:
+        log.warning("pytesseract is installed but the tesseract binary is "
+                    "missing from this host (install the tesseract-ocr "
+                    "system package)")
+        return None
+    except Exception as e:
+        log.warning("OCR failed: %s", e)
+        return None
+
+
+def _ocr_pdf_pages(path: Path, max_chars: int, max_pages: int = 20) -> Optional[str]:
+    """Render a scanned/image-only PDF's pages and OCR each one.
+
+    Uses PyMuPDF (no external binary needed) to rasterize pages, so the only
+    system dependency this adds is the tesseract-ocr binary itself.
+    """
+    try:
+        import fitz  # PyMuPDF
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        doc = fitz.open(str(path))
+        chunks, total = [], 0
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+            pix = page.get_pixmap(dpi=200)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            text = pytesseract.image_to_string(img).strip()
+            if text:
+                chunks.append(f"[Page {i + 1}]\n{text}")
+                total += len(text)
+            if total > max_chars:
+                break
+        doc.close()
+        return "\n\n".join(chunks)[:max_chars] or None
+    except pytesseract.pytesseract.TesseractNotFoundError:
+        log.warning("pytesseract is installed but the tesseract binary is "
+                    "missing from this host (install the tesseract-ocr "
+                    "system package)")
+        return None
+    except Exception as e:
+        log.warning("PDF OCR failed for %s: %s", path.name, e)
+        return None
+
+
+def _extract_attachment_text(path: Path, content_type: str,
+                             max_chars: int = 40000) -> Optional[str]:
+    """Best-effort text extraction for PDF/DOCX/PPTX/image uploads.
+
+    Never raises: an unsupported or unparsable file returns None so the
+    caller can fall back to the analyze_data/query_data hint instead of
+    breaking the chat turn. Image-only ("scanned") PDFs fall through to OCR
+    automatically when the embedded-text extraction comes back too sparse.
+    """
+    ct = (content_type or "").lower()
+    suffix = path.suffix.lower()
+    try:
+        if ct.startswith("image/") or suffix in (
+                ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif", ".bmp", ".gif"):
+            return _ocr_image_bytes(path.read_bytes())
+        if ct == "application/pdf" or suffix == ".pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(str(path))
+            pages, total = [], 0
+            for pg in reader.pages:
+                t = pg.extract_text() or ""
+                pages.append(t)
+                total += len(t)
+                if total > max_chars:
+                    break
+            text = "\n".join(pages).strip()
+            # Heuristic: real text-based PDFs average well over 20 chars/page;
+            # a lower yield usually means the pages are scanned images.
+            if text and len(text) >= 20 * max(1, len(reader.pages)):
+                return text[:max_chars]
+            ocr_text = _ocr_pdf_pages(path, max_chars)
+            return ocr_text or (text[:max_chars] or None)
+        if suffix == ".docx" or ct == (
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"):
+            from docx import Document
+            doc = Document(str(path))
+            return "\n".join(p.text for p in doc.paragraphs)[:max_chars] or None
+        if suffix == ".pptx" or ct == (
+                "application/vnd.openxmlformats-officedocument."
+                "presentationml.presentation"):
+            from pptx import Presentation
+            prs = Presentation(str(path))
+            chunks, total = [], 0
+            for i, slide in enumerate(prs.slides, 1):
+                lines = [f"[Slide {i}]"]
+                for shape in slide.shapes:
+                    if getattr(shape, "has_text_frame", False) and shape.text_frame.text:
+                        lines.append(shape.text_frame.text)
+                chunk = "\n".join(lines)
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_chars:
+                    break
+            return "\n\n".join(chunks)[:max_chars] or None
+    except ImportError:
+        return None
+    except Exception as e:
+        log.warning("attachment text extraction failed for %s: %s", path.name, e)
+        return None
+    return None
+
+
+async def _ocr_image(source: str, user_id: str, **_: Any) -> dict[str, Any]:
+    """OCR a stored image or scanned PDF and return the extracted text."""
+    path = await _resolve_source(source, user_id)
+    if not path:
+        return {"error": "no such file, or you don't own it"}
+    ctype = mimetypes.guess_type(str(path))[0] or ""
+    text = _extract_attachment_text(path, ctype)
+    if text is None:
+        return {"error": "OCR unavailable (missing pytesseract/tesseract on "
+                          "this host, or no text found in the file)"}
+    return {"text": text}
+
+
+async def _transcribe_audio(source: str, user_id: str, **_: Any) -> dict[str, Any]:
+    """Transcribe a stored audio file (voice note, recording) via OpenAI."""
+    if not OPENAI_API_KEY:
+        return {"error": "audio transcription requires OPENAI_API_KEY to be configured"}
+    path = await _resolve_source(source, user_id)
+    if not path:
+        return {"error": "no such file, or you don't own it"}
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        return {"error": f"could not read file: {e}"}
+    ctype = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+    try:
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post(
+                f"{OPENAI_BASE_URL}/audio/transcriptions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                data={"model": TRANSCRIBE_MODEL},
+                files={"file": (path.name, data, ctype)})
+            r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        detail = ""
+        try:
+            detail = e.response.text[:300]
+        except Exception:
+            pass
+        return {"error": f"transcription failed: HTTP {e.response.status_code}",
+                "detail": detail}
+    except httpx.HTTPError as e:
+        return {"error": f"transcription request failed: {e}"}
+    text = (r.json() or {}).get("text", "")
+    return {"text": text} if text else {"error": "transcription returned no text"}
+
+
 # ---------------- DATA ANALYST ----------------
 async def _make_chart(chart_type: str, title: str, x: list, y: list,
                       series_label: str = "", x_label: str = "", y_label: str = "",
@@ -2548,6 +2792,14 @@ class ToolRegistry:
                           "paragraphs": {"type": "array"}},
            "required": ["title", "paragraphs"]},
           _generate_docx, is_async=True)
+        R("generate_pptx",
+          "Generate a PowerPoint deck. slides = [{heading, bullets: [str,...]}].",
+          {"type": "object",
+           "properties": {"filename": {"type": "string"},
+                          "title": {"type": "string"},
+                          "slides": {"type": "array"}},
+           "required": ["title", "slides"]},
+          _generate_pptx, is_async=True)
         R("make_chart",
           "Generate a chart image (line, bar, scatter, pie) from x/y data.",
           {"type": "object",
@@ -2560,6 +2812,19 @@ class ToolRegistry:
                           "y_label": {"type": "string"}},
            "required": ["chart_type", "x", "y"]},
           _make_chart, is_async=True)
+        R("ocr_image",
+          "Extract text from a stored image or scanned PDF using OCR.",
+          {"type": "object",
+           "properties": {"source": {"type": "string"}},
+           "required": ["source"]},
+          _ocr_image, is_async=True, needs_user=True)
+        R("transcribe_audio",
+          "Transcribe a stored audio file (voice note, recording) to text. "
+          "Requires OPENAI_API_KEY.",
+          {"type": "object",
+           "properties": {"source": {"type": "string"}},
+           "required": ["source"]},
+          _transcribe_audio, is_async=True, needs_user=True)
         R("analyze_data",
           "Analyze a CSV/Parquet/JSON file (pass the stored filename) or raw CSV text.",
           {"type": "object",
@@ -3561,11 +3826,27 @@ async def chat_with_files(body: ChatWithFilesRequest,
         if ct.startswith("text/") or ct in ("application/json", "application/csv"):
             text = p.read_text(errors="replace")[:40000]
             context_parts.append(f"[Attached file: {row['filename']}]\n{text}")
+        elif ct.startswith("audio/"):
+            result = await _transcribe_audio(row["stored_name"], user["id"])
+            if result.get("text"):
+                context_parts.append(
+                    f"[Attached voice note: {row['filename']}]\n{result['text']}")
+            else:
+                context_parts.append(
+                    f"[Attached voice note: {row['filename']} ({ct}, "
+                    f"{p.stat().st_size} bytes) — transcription unavailable "
+                    f"({result.get('error', 'unknown error')}); call "
+                    f"transcribe_audio with source '{row['stored_name']}' to retry]")
         else:
-            context_parts.append(
-                f"[Attached file: {row['filename']} ({ct}, "
-                f"{p.stat().st_size} bytes) — to analyze, call analyze_data "
-                f"or query_data with source '{row['stored_name']}']")
+            extracted = _extract_attachment_text(p, ct)
+            if extracted:
+                context_parts.append(
+                    f"[Attached file: {row['filename']}]\n{extracted}")
+            else:
+                context_parts.append(
+                    f"[Attached file: {row['filename']} ({ct}, "
+                    f"{p.stat().st_size} bytes) — to analyze, call analyze_data "
+                    f"or query_data with source '{row['stored_name']}']")
 
     full_prompt = body.prompt
     if context_parts:
