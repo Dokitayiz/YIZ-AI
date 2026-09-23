@@ -1867,16 +1867,126 @@ async def _stream_anthropic(msgs: list[dict], tools_list: list[dict],
         yield {"type": "tool_calls", "calls": calls}
 
 
+# ---------------- PER-TASK MODEL ROUTING (kimi / deepseek) ----------------
+# Anthropic and OpenAI models are picked explicitly via *_MODEL env vars, since
+# their naming isn't consistent enough to route on safely. Kimi and DeepSeek
+# each publish a small, predictable family (a general chat model plus a
+# reasoning/"thinking" variant), so for those two providers we pick the
+# specific model from the *live* catalog based on what the prompt looks like,
+# rather than always using the single configured default.
+#
+# This is a lightweight heuristic, not a benchmarked router: it looks at
+# surface features of the prompt (code fences, math/proof language, length)
+# and matches them against model-name keywords returned by /api/models right
+# now, so it keeps working if either provider renames or adds models. It will
+# never be as good as picking per-task based on your own eval results.
+AUTO_ROUTE_PROVIDERS = frozenset({"kimi", "deepseek"})
+
+_CODE_RE = re.compile(
+    r"```|\b(?:function|debug|traceback|stack trace|compile|refactor|"
+    r"regex|unit test|class \w+|def \w+|import \w+)\b", re.I)
+_REASONING_RE = re.compile(
+    r"\b(?:prove|proof|step by step|derive|theorem|reasoning|logic puzzle|"
+    r"solve for|optimi[sz]e|algorithm complexity)\b", re.I)
+
+# Keyword to look for in a live model id for each (provider, task) pair.
+# Empty string means "use the provider's own configured default".
+_ROUTE_KEYWORDS: dict[str, dict[str, str]] = {
+    "deepseek": {"code": "reasoner", "reasoning": "reasoner", "general": ""},
+    "kimi": {"code": "k2", "reasoning": "thinking", "general": ""},
+}
+
+
+def _classify_task(prompt: str) -> str:
+    """Rough (code | reasoning | general) label for routing purposes only."""
+    if _CODE_RE.search(prompt or ""):
+        return "code"
+    if _REASONING_RE.search(prompt or "") or len(prompt or "") > 2000:
+        return "reasoning"
+    return "general"
+
+
+async def _auto_pick_model(provider: str, prompt: str) -> Optional[str]:
+    """Best-effort per-task model choice within one provider's own catalog.
+
+    Returns None (meaning: use the configured default) if the provider isn't
+    auto-routed, the keyword has no match in the live catalog, or the catalog
+    call itself fails — routing degrades to the static default, it never
+    blocks or errors the chat turn.
+    """
+    hints = _ROUTE_KEYWORDS.get(provider)
+    if not hints:
+        return None
+    keyword = hints.get(_classify_task(prompt), "")
+    if not keyword:
+        return None
+    available = await _list_provider_models(provider)
+    matches = sorted((m for m in available if keyword in m.lower()), key=len)
+    return matches[0] if matches else None
+
+
+def _opaque_llm_error(e: Exception, provider: str) -> LLMError:
+    """Wrap any exception as an LLMError with a logged reference id.
+
+    Keeps raw provider error bodies (which can include account/billing
+    detail) out of the user-facing message while still letting an operator
+    find the real cause by grepping server logs for the ref id shown to the
+    user.
+    """
+    if isinstance(e, LLMError):
+        return e
+    rid = uuid.uuid4().hex[:8]
+    log.error("llm:%s %s unexpected error: %s: %s", rid, provider, type(e).__name__, e)
+    return LLMError(f"LLM provider error (ref {rid})")
+
+
 async def stream_chat(msgs: list[dict], tools_list: list[dict],
-                      requested_model: Optional[str] = None) -> AsyncGenerator[dict, None]:
-    """Stream a completion from the requested model, or the configured default."""
-    provider, model = resolve_model(requested_model)
+                      requested_model: Optional[str] = None,
+                      routing_prompt: Optional[str] = None) -> AsyncGenerator[dict, None]:
+    """Stream a completion, failing over to the next configured provider.
+
+    A caller-pinned model (requested_model) is honored exactly — no silent
+    failover, since the person asked for that model specifically. Otherwise
+    every configured provider in _PROVIDER_ORDER is tried in turn: if one
+    fails *before it has produced any output* (auth/config/rate-limit errors
+    typically fail immediately, before the first token), the next configured
+    provider is tried instead automatically. Once a provider has started
+    streaming text, a failure is surfaced as-is rather than silently
+    retried, since re-sending the prompt to a different provider mid-stream
+    would duplicate or corrupt the partial answer already shown.
+    """
     if requested_model:
+        provider, model = resolve_model(requested_model)
         await _validate_model_override(provider, model)
-    gen = (_stream_anthropic(msgs, tools_list, model) if provider == "anthropic"
-           else _stream_openai(msgs, tools_list, model, provider))
-    async for ev in gen:
-        yield ev
+        candidates = [(provider, model)]
+    else:
+        candidates = [(n, _PROVIDERS[n][1]) for n in _PROVIDER_ORDER if _PROVIDERS[n][0]]
+        if not candidates:
+            raise LLMError("No LLM configured. Set an API key for at least one provider.")
+
+    last_error: Optional[Exception] = None
+    for i, (provider, model) in enumerate(candidates):
+        if not requested_model and provider in AUTO_ROUTE_PROVIDERS and routing_prompt:
+            auto = await _auto_pick_model(provider, routing_prompt)
+            if auto:
+                model = auto
+        gen = (_stream_anthropic(msgs, tools_list, model) if provider == "anthropic"
+               else _stream_openai(msgs, tools_list, model, provider))
+        yielded_any = False
+        try:
+            async for ev in gen:
+                yielded_any = True
+                yield ev
+            return
+        except Exception as e:
+            last_error = e
+            is_last = i == len(candidates) - 1
+            if yielded_any or is_last:
+                raise _opaque_llm_error(e, provider)
+            log.warning("provider %s failed before producing output (%s: %s); "
+                       "trying next configured provider", provider, type(e).__name__, e)
+    if last_error:  # pragma: no cover — unreachable, kept as a defensive fallback
+        raise _opaque_llm_error(last_error, candidates[-1][0])
 
 
 # ---------------- TOOL HELPERS ----------------
@@ -3712,7 +3822,7 @@ async def agent_stream(prompt: str, cid: str, user_id: str,
     for _ in range(MAX_STEPS):
         parts, calls = [], []
         try:
-            async for ev in stream_chat(msgs, schemas, model):
+            async for ev in stream_chat(msgs, schemas, model, prompt):
                 if ev["type"] == "text":
                     parts.append(ev["delta"])
                     yield sse("token", {"delta": ev["delta"]})
